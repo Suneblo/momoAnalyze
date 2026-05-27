@@ -1,0 +1,523 @@
+* { box-sizing: border-box; }
+
+
+:root {
+  --momo-global-zoom: 1;
+  --momo-base-font-size: calc(14px * var(--momo-global-zoom));
+  --momo-small-font-size: calc(13px * var(--momo-global-zoom));
+  --momo-title-font-size: calc(18px * var(--momo-global-zoom));
+  --momo-card-padding: calc(20px * var(--momo-global-zoom));
+  --momo-card-gap: calc(20px * var(--momo-global-zoom));
+  --momo-control-height: calc(32px * var(--momo-global-zoom));
+  --momo-control-padding-x: calc(12px * var(--momo-global-zoom));
+  --momo-table-cell-padding-y: calc(8px * var(--momo-global-zoom));
+  --momo-table-cell-padding-x: calc(10px * var(--momo-global-zoom));
+  --momo-chart-height: calc(350px * var(--momo-global-zoom));
+
+  --el-font-size-extra-large: calc(20px * var(--momo-global-zoom));
+  --el-font-size-large: calc(18px * var(--momo-global-zoom));
+  --el-font-size-medium: calc(16px * var(--momo-global-zoom));
+  --el-font-size-base: var(--momo-base-font-size);
+  --el-font-size-small: var(--momo-small-font-size);
+  --el-font-size-extra-small: calc(12px * var(--momo-global-zoom));
+  --el-component-size-large: calc(40px * var(--momo-global-zoom));
+  --el-component-size: var(--momo-control-height);
+  --el-component-size-small: calc(24px * var(--momo-global-zoom));
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text-main);
+  line-height: 1.6;
+  font-size: var(--momo-base-font-size);
+}
+
+.card {
+  background: var(--card-bg);
+  border-radius: 16px;
+  padding: var(--momo-card-padding);
+  margin-bottom: var(--momo-card-gap);
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+  min-width: 0;
+}
+
+h1 { font-size: calc(24px * var(--momo-global-zoom)); margin: 0 0 8px 0; font-weight: 600; color: #111827; }
+h2 { font-size: calc(18px * var(--momo-global-zoom)); margin: 0 0 16px 0; font-weight: 600; color: #111827; }
+
+.info-text { font-size: var(--momo-small-font-size); color: var(--text-muted); margin-bottom: 4px; }
+
+.status-badge {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: calc(13px * var(--momo-global-zoom));
+  font-weight: 500;
+}
+
+.status-badge.loading { background: #dbeafe; color: #1d4ed8; }
+.status-badge.ok { background: #dcfce7; color: #16a34a; }
+.status-badge.bad { background: #fee2e2; color: #dc2626; }
+
+.chart-tooltip {
+  position: absolute;
+  background: rgba(255,255,255,.95);
+  backdrop-filter: blur(4px);
+  border: 1px solid var(--border);
+  box-shadow: 0 10px 15px -3px rgba(0,0,0,.1);
+  padding: 12px 16px;
+  border-radius: 10px;
+  font-size: var(--momo-small-font-size);
+  z-index: 100;
+  pointer-events: auto;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+
+
+/* ===== Global zoom density ===== */
+button,
+input,
+select,
+textarea,
+.btn,
+.link-button,
+.el-button,
+.el-input,
+.el-select,
+.el-textarea,
+.el-input__inner,
+.el-select__placeholder,
+.el-select__selected-item,
+.el-textarea__inner {
+  font-size: var(--momo-base-font-size);
+}
+
+button,
+.btn,
+.link-button,
+.el-button {
+  min-height: var(--momo-control-height);
+  padding-left: var(--momo-control-padding-x);
+  padding-right: var(--momo-control-padding-x);
+}
+
+.el-input__wrapper,
+.el-select__wrapper,
+.el-textarea__inner {
+  min-height: var(--momo-control-height);
+}
+
+.el-input__inner,
+.el-select__placeholder,
+.el-select__selected-item {
+  min-height: var(--momo-control-height);
+  line-height: var(--momo-control-height);
+}
+
+table,
+.el-table,
+.mini-table,
+.summary-table {
+  font-size: var(--momo-base-font-size);
+}
+
+th,
+td,
+.el-table th.el-table__cell,
+.el-table td.el-table__cell {
+  padding: var(--momo-table-cell-padding-y) var(--momo-table-cell-padding-x);
+}
+
+.chart-box,
+.chart-container,
+.base-chart,
+.echarts,
+.chart,
+.fixed-y-chart,
+.fixed-y-scroll-body {
+  min-height: var(--momo-chart-height) !important;
+  height: var(--momo-chart-height) !important;
+}
+
+/* 统计表列很多时只横向滚动，不压缩到卡片宽度内。 */
+.stat-table-scroll,
+.table-wrapper {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+
+.stat-table-scroll table,
+.table-wrapper table {
+  width: max-content;
+  min-width: 100%;
+}
+
+.stat-table-scroll th,
+.stat-table-scroll td,
+.table-wrapper th,
+.table-wrapper td {
+  white-space: nowrap;
+}
+
+.no-squeeze-table .el-table__cell {
+  white-space: nowrap;
+}
+
+/* ===== Mobile compact density: shrink all UI layers on phones ===== */
+:root {
+  --momo-mobile-font-size: calc(12px * var(--momo-global-zoom));
+  --momo-mobile-small-font-size: calc(11px * var(--momo-global-zoom));
+  --momo-mobile-card-padding: calc(10px * var(--momo-global-zoom));
+  --momo-mobile-card-gap: calc(10px * var(--momo-global-zoom));
+  --momo-mobile-control-height: calc(26px * var(--momo-global-zoom));
+  --momo-mobile-control-padding-x: calc(8px * var(--momo-global-zoom));
+  --momo-mobile-table-cell-padding-y: calc(5px * var(--momo-global-zoom));
+  --momo-mobile-table-cell-padding-x: calc(6px * var(--momo-global-zoom));
+  --momo-mobile-chart-height: calc(240px * var(--momo-global-zoom));
+}
+
+@media (max-width: 768px) {
+  :root {
+    --el-font-size-extra-large: calc(16px * var(--momo-global-zoom));
+    --el-font-size-large: calc(14px * var(--momo-global-zoom));
+    --el-font-size-medium: calc(13px * var(--momo-global-zoom));
+    --el-font-size-base: var(--momo-mobile-font-size);
+    --el-font-size-small: var(--momo-mobile-small-font-size);
+    --el-font-size-extra-small: calc(10px * var(--momo-global-zoom));
+    --el-component-size-large: calc(32px * var(--momo-global-zoom));
+    --el-component-size: calc(28px * var(--momo-global-zoom));
+    --el-component-size-small: calc(24px * var(--momo-global-zoom));
+    --el-border-radius-base: 6px;
+    --el-border-radius-small: 4px;
+  }
+
+  html,
+  body,
+  #app {
+    font-size: var(--momo-mobile-font-size) !important;
+  }
+
+  body {
+    line-height: 1.35;
+  }
+
+  .container {
+    padding: 8px !important;
+  }
+
+  .page-tabs {
+    gap: 6px !important;
+    margin: 6px 0 10px !important;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .page-tab {
+    height: calc(28px * var(--momo-global-zoom)) !important;
+    min-height: calc(28px * var(--momo-global-zoom)) !important;
+    padding: 0 10px !important;
+    font-size: calc(12px * var(--momo-global-zoom)) !important;
+    white-space: nowrap;
+    border-radius: 8px !important;
+  }
+
+  .card,
+  .el-card,
+  .header-card,
+  .setting-card,
+  .panel,
+  .result-panel,
+  .workspace-section,
+  .alert-item,
+  .summary-card {
+    padding: var(--momo-mobile-card-padding) !important;
+    margin-bottom: var(--momo-mobile-card-gap) !important;
+    border-radius: 10px !important;
+  }
+
+  .card-grid,
+  .page-shell,
+  .main-layout,
+  .word-list-layout,
+  .form-grid,
+  .summary-grid,
+  .setting-grid {
+    gap: var(--momo-mobile-card-gap) !important;
+  }
+
+  h1 {
+    font-size: calc(18px * var(--momo-global-zoom)) !important;
+    line-height: 1.25 !important;
+    margin-bottom: 6px !important;
+  }
+
+  h2 {
+    font-size: calc(16px * var(--momo-global-zoom)) !important;
+    line-height: 1.25 !important;
+    margin-bottom: 8px !important;
+  }
+
+  h3,
+  h4,
+  .card-title,
+  .section-title,
+  .summary-label,
+  .alert-main {
+    font-size: calc(14px * var(--momo-global-zoom)) !important;
+    line-height: 1.25 !important;
+  }
+
+  .info-text,
+  .muted,
+  .hint,
+  .desc,
+  .meta-text,
+  .summary-sub,
+  .alert-sub,
+  .status-line,
+  .error-text {
+    font-size: var(--momo-mobile-small-font-size) !important;
+    line-height: 1.35 !important;
+  }
+
+  .toolbar,
+  .compact-toolbar,
+  .inline-actions,
+  .card-header,
+  .section-header,
+  .summary-tools,
+  .word-list-actions,
+  .word-list-sortbar,
+  .info-row,
+  .check-list {
+    gap: 6px !important;
+    margin-bottom: 8px !important;
+  }
+
+  button,
+  input,
+  select,
+  textarea,
+  .btn,
+  .link-button,
+  .el-button,
+  .el-input,
+  .el-select,
+  .el-textarea,
+  .el-input__inner,
+  .el-select__placeholder,
+  .el-select__selected-item,
+  .el-textarea__inner {
+    font-size: var(--momo-mobile-font-size) !important;
+  }
+
+  button,
+  .btn,
+  .link-button,
+  .el-button {
+    min-height: var(--momo-mobile-control-height) !important;
+    height: var(--momo-mobile-control-height) !important;
+    padding: 0 var(--momo-mobile-control-padding-x) !important;
+    border-radius: 6px !important;
+    line-height: 1.2 !important;
+  }
+
+  .el-button.is-circle {
+    width: var(--momo-mobile-control-height) !important;
+    min-width: var(--momo-mobile-control-height) !important;
+    padding: 0 !important;
+  }
+
+  .el-input__wrapper,
+  .el-select__wrapper,
+  .el-textarea__inner {
+    min-height: var(--momo-mobile-control-height) !important;
+    padding-left: 8px !important;
+    padding-right: 8px !important;
+  }
+
+  .el-input__inner,
+  .el-select__placeholder,
+  .el-select__selected-item {
+    height: var(--momo-mobile-control-height) !important;
+    min-height: var(--momo-mobile-control-height) !important;
+    line-height: var(--momo-mobile-control-height) !important;
+  }
+
+  textarea,
+  .el-textarea__inner,
+  .word-list-output,
+  .preview-textarea {
+    line-height: 1.35 !important;
+    padding: 6px 8px !important;
+  }
+
+  label,
+  .field,
+  .date-field,
+  .checkbox-field,
+  .el-checkbox,
+  .el-radio {
+    font-size: var(--momo-mobile-font-size) !important;
+  }
+
+  .el-checkbox,
+  .el-radio {
+    min-height: calc(22px * var(--momo-global-zoom)) !important;
+    height: auto !important;
+    margin-right: 8px !important;
+  }
+
+  .el-checkbox__label,
+  .el-radio__label {
+    font-size: var(--momo-mobile-font-size) !important;
+    padding-left: 5px !important;
+  }
+
+  .el-checkbox__inner,
+  .el-radio__inner {
+    width: 12px !important;
+    height: 12px !important;
+  }
+
+  .el-switch {
+    transform: scale(0.82);
+    transform-origin: left center;
+  }
+
+  .el-tag,
+  .word-tag,
+  .status-badge {
+    font-size: calc(11px * var(--momo-global-zoom)) !important;
+    padding: 2px 6px !important;
+    line-height: 1.35 !important;
+    border-radius: 999px !important;
+  }
+
+  .table-wrapper,
+  .stat-table-scroll {
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  table,
+  .el-table,
+  .mini-table,
+  .summary-table {
+    font-size: var(--momo-mobile-font-size) !important;
+  }
+
+  th,
+  td,
+  .el-table th.el-table__cell,
+  .el-table td.el-table__cell {
+    padding: var(--momo-mobile-table-cell-padding-y) var(--momo-mobile-table-cell-padding-x) !important;
+    white-space: nowrap !important;
+  }
+
+  .el-table .cell {
+    line-height: 1.3 !important;
+    padding-left: 4px !important;
+    padding-right: 4px !important;
+    white-space: nowrap !important;
+  }
+
+  .chart-box,
+  .chart-container,
+  .base-chart,
+  .echarts,
+  .chart,
+  .fixed-y-chart,
+  .fixed-y-scroll-body {
+    min-height: var(--momo-mobile-chart-height) !important;
+    height: var(--momo-mobile-chart-height) !important;
+  }
+
+  .chart-tooltip {
+    font-size: calc(11px * var(--momo-global-zoom)) !important;
+    padding: 8px 10px !important;
+    border-radius: 8px !important;
+  }
+
+  .floating-data-actions,
+  .floating-actions,
+  .floating-toolbar,
+  .fixed-actions {
+    right: 8px !important;
+    bottom: 8px !important;
+    gap: 6px !important;
+  }
+
+  .floating-data-actions .el-button,
+  .floating-actions .el-button,
+  .floating-toolbar .el-button,
+  .fixed-actions .el-button {
+    height: calc(30px * var(--momo-global-zoom)) !important;
+    min-height: calc(30px * var(--momo-global-zoom)) !important;
+    padding: 0 9px !important;
+    font-size: calc(12px * var(--momo-global-zoom)) !important;
+  }
+
+  .el-dialog {
+    width: calc(100vw - 20px) !important;
+    max-width: calc(100vw - 20px) !important;
+    margin: 10px auto !important;
+  }
+
+  .el-dialog__header,
+  .el-message-box__header {
+    padding: 10px 12px !important;
+  }
+
+  .el-dialog__body,
+  .el-message-box__content {
+    padding: 8px 12px !important;
+    font-size: var(--momo-mobile-font-size) !important;
+  }
+
+  .el-dialog__footer,
+  .el-message-box__btns {
+    padding: 8px 12px 12px !important;
+  }
+
+  .el-drawer {
+    width: min(92vw, 360px) !important;
+  }
+
+  .el-message,
+  .el-notification {
+    max-width: calc(100vw - 20px) !important;
+    font-size: var(--momo-mobile-font-size) !important;
+  }
+}
+
+@media (max-width: 430px) {
+  :root {
+    --momo-mobile-font-size: calc(11px * var(--momo-global-zoom));
+    --momo-mobile-small-font-size: calc(10px * var(--momo-global-zoom));
+    --momo-mobile-card-padding: calc(8px * var(--momo-global-zoom));
+    --momo-mobile-card-gap: calc(8px * var(--momo-global-zoom));
+    --momo-mobile-control-height: calc(24px * var(--momo-global-zoom));
+    --momo-mobile-control-padding-x: calc(7px * var(--momo-global-zoom));
+    --momo-mobile-table-cell-padding-y: calc(4px * var(--momo-global-zoom));
+    --momo-mobile-table-cell-padding-x: calc(5px * var(--momo-global-zoom));
+    --momo-mobile-chart-height: calc(220px * var(--momo-global-zoom));
+  }
+}
+
+
+/* ===== Chart zoom passthrough =====
+   BaseChart reads --momo-global-zoom and scales ECharts options directly.
+   Do not force .chart-canvas height here, otherwise inline per-chart heights are overridden. */
+.chart-fixed-y-shell,
+.chart-scroll-shell {
+  font-size: var(--momo-base-font-size);
+}
