@@ -251,7 +251,7 @@ def latest_complete_snapshot(conn: sqlite3.Connection) -> str | None:
     row = conn.execute(
         """
         SELECT snapshot_time
-        FROM snapshots
+        FROM snaps
         WHERE COALESCE(data_complete, 1)=1 AND COALESCE(api_success, 1)=1
         ORDER BY snapshot_time DESC
         LIMIT 1
@@ -266,7 +266,7 @@ def latest_snapshot_status(conn: sqlite3.Connection) -> dict[str, object] | None
         SELECT snapshot_time,
                COALESCE(data_complete, 1) AS data_complete,
                COALESCE(api_success, 1) AS api_success
-        FROM snapshots
+        FROM snaps
         ORDER BY snapshot_time DESC
         LIMIT 1
         """
@@ -881,7 +881,7 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
                 service_log(f"API 数据库连接+打开 {parsed.path} 耗时 {(time.perf_counter() - open_start) * 1000:.1f}ms")
 
                 if parsed.path == "/api/health":
-                    row = conn.execute("SELECT value FROM compact_meta WHERE key='schema_version'").fetchone()
+                    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
                     payload = {
                         "success": True,
                         "database": str(self.server.db_path),
@@ -962,7 +962,7 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
                     rows = conn.execute(
                         """
                         SELECT DISTINCT study_day_key
-                        FROM snapshots
+                        FROM snaps
                         WHERE COALESCE(data_complete, 1)=1
                           AND COALESCE(api_success, 1)=1
                         ORDER BY study_day_key

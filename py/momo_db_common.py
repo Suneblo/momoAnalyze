@@ -446,9 +446,22 @@ def canonical_spelling(obj: dict[str, Any] | None) -> str | None:
         return None
     value = obj.get("voc_spelling")
     if value in (None, ""):
+        value = obj.get("spelling")
+    if value in (None, ""):
+        value = obj.get("word")
+    if value in (None, ""):
         return None
     text = str(value).strip()
     return text or None
+
+
+def canonical_word_key(obj: dict[str, Any] | None) -> str | None:
+    """本地分析使用 spelling 作为单词键；空 spelling 时仅用 voc_id 兜底。"""
+    spelling = canonical_spelling(obj)
+    if spelling:
+        return spelling
+    voc_id = canonical_voc_id(obj)
+    return f"voc:{voc_id}" if voc_id else None
 
 
 def _json_obj(text: Any) -> dict[str, Any]:
@@ -465,31 +478,20 @@ def _json_obj(text: Any) -> dict[str, Any]:
 
 
 def item_key(item: dict[str, Any]) -> str:
-    """生成今日 item 的稳定身份 key，优先使用 voc_id，其次使用 spelling。"""
-    voc_id = canonical_voc_id(item)
-    if voc_id:
-        return f"id:{voc_id}"
-    spelling = canonical_spelling(item) or ""
-    # order is a mutable field, so it must not participate in identity.
-    # Otherwise a reordered item would look like a new word.
-    return f"word:{_stable_text_key(spelling)}"
+    """生成今日 item 的稳定身份 key，使用本地 word_key。"""
+    return canonical_word_key(item) or ""
 
 
 def record_key(record: dict[str, Any]) -> str:
-    """生成 overview record 的稳定身份 key，优先使用 voc_id，其次使用 spelling。"""
-    voc_id = canonical_voc_id(record)
-    if voc_id:
-        return f"id:{voc_id}"
-    spelling = canonical_spelling(record) or ""
-    # Use spelling as the stable identity only when API data lacks voc_id.
-    # Mutable state must not participate in identity.
-    return f"word:{_stable_text_key(spelling)}"
+    """生成 overview record 的稳定身份 key，使用本地 word_key。"""
+    return canonical_word_key(record) or ""
 
 
 def item_payload(item: dict[str, Any], *, present_state: str = "observed") -> dict[str, Any]:
     """把 API 今日 item 转换为数据库存储用 payload。"""
     return {
         "item_key": item_key(item),
+        "word_key": canonical_word_key(item),
         "voc_id": text_or_none(canonical_voc_id(item)),
         "voc_spelling": text_or_none(canonical_spelling(item)),
         "order_index": nullable_int(item.get("order")),
@@ -504,6 +506,7 @@ def item_payload(item: dict[str, Any], *, present_state: str = "observed") -> di
 def item_state_hash(payload: dict[str, Any]) -> str:
     """根据 item 关键状态字段生成哈希，用于判断状态是否变化。"""
     return stable_hash({
+        "word_key": payload.get("word_key"),
         "voc_id": payload.get("voc_id"),
         "voc_spelling": payload.get("voc_spelling"),
         "order_index": payload.get("order_index"),
@@ -522,6 +525,7 @@ def record_payload(record: dict[str, Any], reference_day: str) -> dict[str, Any]
     state, overdue = current_state(last_response, text_or_none(record.get("next_study_date")), reference_day)
     return {
         "record_key": record_key(record),
+        "word_key": canonical_word_key(record),
         "voc_id": text_or_none(canonical_voc_id(record)),
         "spelling": text_or_none(canonical_spelling(record)),
         "add_date": text_or_none(record.get("add_date")),
@@ -544,6 +548,7 @@ def record_payload(record: dict[str, Any], reference_day: str) -> dict[str, Any]
 def record_state_hash(payload: dict[str, Any]) -> str:
     """根据 record 关键状态字段生成哈希，用于判断状态是否变化。"""
     return stable_hash({
+        "word_key": payload.get("word_key"),
         "voc_id": payload.get("voc_id"),
         "spelling": payload.get("spelling"),
         "add_date": payload.get("add_date"),
@@ -618,7 +623,7 @@ def progress_today_breakdown(items: Iterable[dict[str, Any]]) -> dict[str, int]:
 def build_latest_progress_payload_from_items(row: sqlite3.Row | dict[str, Any], items: list[dict[str, Any]]) -> dict[str, Any]:
     """Return the single canonical progress payload used by dashboard APIs.
 
-    Historical code stored several overlapping counters in snapshot_progress and
+    Historical code stored several overlapping counters in progress and
     the frontend also recalculated them from allItems.  This helper makes the
     API source of truth explicit: counters are derived once from the reconstructed
     study-day items, and the raw allItems array is not embedded in dashboard-day

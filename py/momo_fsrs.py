@@ -139,7 +139,7 @@ class WordEvent:
 
 
 def _record_key(record: dict[str, Any]) -> str:
-    return str(record.get("record_key") or record.get("voc_id") or record.get("spelling") or "").strip().lower()
+    return str(record.get("word_key") or record.get("record_key") or record.get("spelling") or record.get("voc_id") or "").strip()
 
 
 def _record_word(record: dict[str, Any]) -> str:
@@ -158,69 +158,59 @@ def _record_study_count(record: dict[str, Any]) -> int:
 
 
 def _build_word_histories(conn: sqlite3.Connection, max_words: int) -> tuple[dict[str, list[WordEvent]], dict[str, dict[str, Any]], str]:
-    """Recover approximate per-word review histories from daily latest overview snapshots.
-
-    A daily overview snapshot stores each word's latest study_count, last_study_date,
-    next_study_date and last_response. When the tuple (study_count, last_study_date,
-    last_response) first appears, we treat it as one historical review event.
-    """
+    """Load per-word review histories from the materialized reviews index."""
     import momo_db  # local import avoids a module import cycle
 
     histories: dict[str, list[WordEvent]] = {}
     current_records: dict[str, dict[str, Any]] = {}
-    seen_event_keys: set[tuple[str, int, str, str]] = set()
     days = momo_db.list_days(conn)
     latest_day = days[-1] if days else ""
 
-    for day in days:
-        snap = momo_db.latest_snapshot_time_for_day(conn, day)
-        if not snap:
+    if latest_day:
+        snap = momo_db.latest_snapshot_time_for_day(conn, latest_day)
+        if snap:
+            for rec in momo_db.reconstruct_overview_records_at(conn, latest_day, snap):
+                key = _record_key(rec)
+                if key:
+                    current_records[key] = rec
+
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM reviews
+        ORDER BY word_key, review_index
+        """
+    ).fetchall()
+    for row in rows:
+        key = str(row["word_key"] or "").strip()
+        if not key:
             continue
-        records = momo_db.reconstruct_overview_records_at(conn, day, snap)
-        for rec in records:
-            key = _record_key(rec)
-            if not key:
-                continue
-            current_records[key] = rec
-            response = _record_response(rec)
-            if not response or response in {"STUDY_RESPONSE_UNSPECIFIED", "未作答"}:
-                continue
-            study_count = _record_study_count(rec)
-            last_study = rec.get("last_study_date") or rec.get("lastStudyDate") or ""
-            review_dt = _to_utc_datetime(str(last_study or ""), fallback_date=day)
-            if not review_dt:
-                continue
-            event_key = (key, study_count, review_dt.date().isoformat(), response)
-            if event_key in seen_event_keys:
-                continue
-            seen_event_keys.add(event_key)
-            prev_date = rec.get("first_study_date") or rec.get("firstStudyDate") or ""
-            next_study = rec.get("next_study_date") or rec.get("nextStudyDate") or ""
-            interval = _days_between(str(last_study or ""), str(prev_date or ""))
-            review_span = _days_between(str(next_study or ""), str(last_study or ""))
-            histories.setdefault(key, []).append(WordEvent(
-                word_key=key,
-                word=_record_word(rec),
-                study_count=study_count,
-                review_datetime=review_dt,
-                response=response,
-                interval_days=interval,
-                last_study_date=str(last_study or ""),
-                next_study_date=str(next_study or ""),
-                review_span_days=review_span,
-            ))
-            if len(histories) >= max_words and key not in histories:
-                break
+        if key not in histories and len(histories) >= max_words:
+            continue
+        response = str(row["last_response"] or row["last_response_cn"] or "").strip()
+        if not response or response in {"STUDY_RESPONSE_UNSPECIFIED", "未作答"}:
+            continue
+        review_dt = _to_utc_datetime(str(row["review_day_key"] or ""), fallback_date=str(row["source_day_key"] or ""))
+        if not review_dt:
+            continue
+        try:
+            study_count = int(row["study_count"] or 0)
+        except Exception:
+            study_count = 0
+        histories.setdefault(key, []).append(WordEvent(
+            word_key=key,
+            word=str(row["spelling"] or key),
+            study_count=study_count,
+            review_datetime=review_dt,
+            response=response,
+            interval_days=row["interval_days"],
+            last_study_date=row["review_day_key"],
+            next_study_date=row["next_study_day_key"],
+            review_span_days=row["review_span_days"],
+        ))
 
     for key, events in histories.items():
         events.sort(key=lambda e: (e.review_datetime, e.study_count))
-        prev_dt: datetime | None = None
-        for e in events:
-            if prev_dt is not None:
-                e.interval_days = max(0, (e.review_datetime.date() - prev_dt.date()).days)
-            elif e.interval_days is None:
-                e.interval_days = 0
-            prev_dt = e.review_datetime
     return histories, current_records, latest_day
 
 
@@ -234,7 +224,7 @@ def build_review_history_state_index(
 
     This exposes the same historical input chain used by the FSRS prediction
     module. Each event is one deduplicated review state recovered from daily
-    overview snapshots. It is meant for consumers that need the previous
+    overview snaps. It is meant for consumers that need the previous
     review state for a current word, such as time-point comparison.
     """
     histories, current_records, _latest_day = _build_word_histories(conn, max_words)

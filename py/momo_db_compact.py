@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Compact v3 SQLite storage implementation for MomoAnalyze.
+"""Compact word-key SQLite storage implementation for MomoAnalyze.
 
-Only the latest compact_v3_voc_id schema is supported. Legacy wide tables and
-migration compatibility paths are intentionally not supported in this module.
+Only the latest compact_v4_word_key schema is supported by runtime code.
 """
 
 from __future__ import annotations
@@ -18,14 +17,14 @@ from momo_db_common import *
 def delete_latest_incomplete_snapshot(conn: sqlite3.Connection) -> dict[str, Any] | None:
     """Delete only the latest snapshot when it is explicitly incomplete.
 
-    Complete historical snapshots are never touched. Older incomplete markers are
+    Complete historical snaps are never touched. Older incomplete markers are
     ignored unless they are the latest snapshot in the database.
     """
     setup_schema(conn)
     row = conn.execute(
         """
         SELECT snapshot_time, study_day_key, incomplete_reason
-        FROM snapshots
+        FROM snaps
         ORDER BY snapshot_time DESC
         LIMIT 1
         """
@@ -37,7 +36,7 @@ def delete_latest_incomplete_snapshot(conn: sqlite3.Connection) -> dict[str, Any
         """
         SELECT COALESCE(data_complete, 1) AS data_complete,
                COALESCE(api_success, 1) AS api_success
-        FROM snapshots
+        FROM snaps
         WHERE snapshot_time=?
         """,
         (row["snapshot_time"],),
@@ -50,7 +49,7 @@ def delete_latest_incomplete_snapshot(conn: sqlite3.Connection) -> dict[str, Any
         "studyDayKey": row["study_day_key"],
         "reason": row["incomplete_reason"] or "",
     }
-    conn.execute("DELETE FROM snapshots WHERE snapshot_time=?", (row["snapshot_time"],))
+    conn.execute("DELETE FROM snaps WHERE snapshot_time=?", (row["snapshot_time"],))
     return info
 
 
@@ -61,7 +60,7 @@ def record_incomplete_snapshot(conn: sqlite3.Connection, *, captured_at: datetim
     snap_time = iso_bj(captured_at, milliseconds=True)
     conn.execute(
         """
-        INSERT INTO snapshots(snapshot_time, study_day_key, source, api_success, data_complete, incomplete_reason, created_at)
+        INSERT INTO snaps(snapshot_time, study_day_key, source, api_success, data_complete, incomplete_reason, created_at)
         VALUES(?,?,?,?,?,?,?)
         ON CONFLICT(snapshot_time) DO UPDATE SET
             study_day_key=excluded.study_day_key,
@@ -123,17 +122,18 @@ def _today_alert_item(item: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-COMPACT_SCHEMA_VERSION = "compact_v3_voc_id"
+COMPACT_SCHEMA_VERSION = "compact_v4_word_key"
 COMPACT_REQUIRED_TABLES = {
-    "compact_meta",
-    "compact_overview_day_checkpoints",
-    "compact_overview_day_records",
-    "compact_overview_patch_events",
-    "compact_study_day_initial_items",
-    "compact_study_day_patch_events",
-    "snapshots",
-    "snapshot_progress",
+    "meta",
+    "days",
+    "records",
+    "record_events",
+    "study_items",
+    "study_events",
+    "snaps",
+    "progress",
     "words",
+    "reviews",
 }
 
 PATCH_EMPTY_MARKER = "enmpty"
@@ -179,15 +179,84 @@ def _overview_old_field(field_name: str) -> str:
     return f"old_{field_name}"
 
 
-def _ensure_narrow_event_schema(conn: sqlite3.Connection) -> None:
-    """Create sparse patch event tables used by the runtime."""
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create the current word-key compact schema."""
+    conn.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS compact_overview_patch_events(
+        CREATE TABLE IF NOT EXISTS words(
+          word_key TEXT PRIMARY KEY,
+          spelling TEXT NOT NULL,
+          voc_id TEXT,
+          first_seen_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_words_voc_id ON words(voc_id)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS snaps(
+          snapshot_time TEXT PRIMARY KEY,
+          study_day_key TEXT NOT NULL,
+          source TEXT NOT NULL,
+          api_success INTEGER NOT NULL DEFAULT 1,
+          data_complete INTEGER NOT NULL DEFAULT 1,
+          incomplete_reason TEXT,
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_snaps_day_time ON snaps(study_day_key, snapshot_time)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS days(
+          study_day_key TEXT PRIMARY KEY,
+          snapshot_time TEXT NOT NULL,
+          record_count INTEGER NOT NULL,
+          created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS records(
+          study_day_key TEXT NOT NULL,
+          word_key TEXT NOT NULL,
+          snapshot_time TEXT NOT NULL,
+          voc_id TEXT,
+          spelling TEXT NOT NULL,
+          add_date TEXT,
+          first_study_date TEXT,
+          last_study_date TEXT,
+          next_study_date TEXT,
+          last_response TEXT,
+          last_response_cn TEXT,
+          study_count REAL,
+          tags_text TEXT,
+          tag_well TEXT,
+          tag_sticking TEXT,
+          current_state TEXT,
+          is_overdue TEXT,
+          state_hash TEXT,
+          PRIMARY KEY(study_day_key, word_key)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_records_word_day ON records(word_key, study_day_key)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_records_day_next ON records(study_day_key, next_study_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_records_day_state ON records(study_day_key, current_state, is_overdue)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_records_day_count ON records(study_day_key, study_count)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_records_day_spelling ON records(study_day_key, spelling)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_records_voc_id ON records(voc_id)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS record_events(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           snapshot_time TEXT NOT NULL,
           study_day_key TEXT NOT NULL,
-          voc_id TEXT NOT NULL,
+          word_key TEXT NOT NULL,
+          voc_id TEXT,
           event_type TEXT NOT NULL,
           last_study_date TEXT,
           next_study_date TEXT,
@@ -204,17 +273,42 @@ def _ensure_narrow_event_schema(conn: sqlite3.Connection) -> None:
           old_tags_text TEXT,
           old_is_overdue TEXT,
           created_at TEXT NOT NULL,
-          UNIQUE(snapshot_time, voc_id, event_type)
+          UNIQUE(snapshot_time, word_key, event_type)
         )
         """
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_record_events_day_time ON record_events(study_day_key, snapshot_time, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_record_events_word_time ON record_events(word_key, snapshot_time)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_record_events_voc_id ON record_events(voc_id)")
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS compact_study_day_patch_events(
+        CREATE TABLE IF NOT EXISTS study_items(
+          study_day_key TEXT NOT NULL,
+          snapshot_time TEXT NOT NULL,
+          word_key TEXT NOT NULL,
+          voc_id TEXT,
+          voc_spelling TEXT NOT NULL,
+          order_index INTEGER,
+          first_response TEXT,
+          is_new INTEGER,
+          is_finished INTEGER,
+          present_state TEXT,
+          state_hash TEXT,
+          PRIMARY KEY(study_day_key, snapshot_time, word_key)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_study_items_day_time ON study_items(study_day_key, snapshot_time)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_study_items_word_day ON study_items(word_key, study_day_key)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_study_items_voc_id ON study_items(voc_id)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS study_events(
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           snapshot_time TEXT NOT NULL,
           study_day_key TEXT NOT NULL,
-          voc_id TEXT NOT NULL,
+          word_key TEXT NOT NULL,
+          voc_id TEXT,
           event_type TEXT NOT NULL,
           voc_spelling TEXT,
           order_index INTEGER,
@@ -223,50 +317,91 @@ def _ensure_narrow_event_schema(conn: sqlite3.Connection) -> None:
           is_finished INTEGER,
           present_state TEXT,
           created_at TEXT NOT NULL,
-          UNIQUE(snapshot_time, voc_id, event_type)
+          UNIQUE(snapshot_time, word_key, event_type)
         )
         """
     )
-
-    existing_overview_event_cols = _compact_columns(conn, "compact_overview_patch_events")
-    overview_old_column_defs = {
-        "old_last_study_date": "TEXT",
-        "old_next_study_date": "TEXT",
-        "old_last_response": "TEXT",
-        "old_study_count": "INTEGER",
-        "old_current_state": "TEXT",
-        "old_tags_text": "TEXT",
-        "old_is_overdue": "TEXT",
-    }
-    for col, typ in overview_old_column_defs.items():
-        if col not in existing_overview_event_cols:
-            conn.execute(f"ALTER TABLE compact_overview_patch_events ADD COLUMN {col} {typ}")
-
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_overview_patch_events_day_time ON compact_overview_patch_events(study_day_key, snapshot_time, id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_overview_patch_events_voc ON compact_overview_patch_events(voc_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_study_day_patch_events_day_time ON compact_study_day_patch_events(study_day_key, snapshot_time, id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_study_day_patch_events_voc ON compact_study_day_patch_events(voc_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_study_events_day_time ON study_events(study_day_key, snapshot_time, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_study_events_word_time ON study_events(word_key, snapshot_time)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_study_events_voc_id ON study_events(voc_id)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS progress(
+          snapshot_time TEXT NOT NULL,
+          study_day_key TEXT NOT NULL,
+          finished INTEGER,
+          total INTEGER,
+          study_time INTEGER,
+          first_forget_done INTEGER,
+          first_forget_all INTEGER,
+          vague_done INTEGER,
+          vague_all INTEGER,
+          familiar_done INTEGER,
+          familiar_all INTEGER,
+          new_words INTEGER,
+          review_words INTEGER,
+          pending_new_words INTEGER,
+          all_items_count INTEGER NOT NULL DEFAULT 0,
+          done_items_count INTEGER NOT NULL DEFAULT 0,
+          todo_items_count INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY(snapshot_time, study_day_key)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_progress_day_time ON progress(study_day_key, snapshot_time)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reviews(
+          word_key TEXT NOT NULL,
+          review_index INTEGER NOT NULL,
+          review_day_key TEXT NOT NULL,
+          source_day_key TEXT NOT NULL,
+          snapshot_time TEXT NOT NULL,
+          voc_id TEXT,
+          spelling TEXT NOT NULL,
+          study_count REAL,
+          last_response TEXT,
+          last_response_cn TEXT,
+          previous_review_day_key TEXT,
+          next_study_day_key TEXT,
+          interval_days INTEGER,
+          review_span_days INTEGER,
+          current_state TEXT,
+          is_overdue TEXT,
+          tags_text TEXT,
+          PRIMARY KEY(word_key, review_index),
+          UNIQUE(word_key, study_count, review_day_key, last_response)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reviews_word_day ON reviews(word_key, review_day_key)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reviews_source_day ON reviews(source_day_key)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reviews_voc_id ON reviews(voc_id)")
 
 
 def setup_schema(conn: sqlite3.Connection) -> None:
-    _ensure_narrow_event_schema(conn)
+    legacy_tables = {"compact_meta", "compact_overview_day_records", "compact_overview_day_checkpoints", "snapshot_progress"}
+    if not _compact_table_exists(conn, "meta") and any(_compact_table_exists(conn, table) for table in legacy_tables):
+        raise RuntimeError("检测到旧版 compact_v3 数据库，请先运行新版迁移到 compact_v4_word_key。")
+    _ensure_schema(conn)
     missing = sorted(t for t in COMPACT_REQUIRED_TABLES if not _compact_table_exists(conn, t))
     if missing:
         raise RuntimeError(
-            "SQLite 数据库不是 compact_v3_voc_id 精简性能版，缺少表: "
+            "SQLite 数据库不是 compact_v4_word_key 版，缺少表: "
             + ", ".join(missing)
             + "。请重新同步生成最新版数据库。"
         )
 
     required_columns = {
-        "words": {"voc_id", "spelling", "first_seen_at", "last_seen_at"},
-        "compact_overview_day_records": {"study_day_key", "snapshot_time", "voc_id", "spelling", "next_study_date", "study_count"},
-        "compact_overview_day_checkpoints": {"study_day_key", "snapshot_time", "record_count", "created_at"},
-        "compact_overview_patch_events": {"study_day_key", "snapshot_time", "voc_id", "event_type", "created_at"},
-        "compact_study_day_initial_items": {"study_day_key", "snapshot_time", "voc_id", "voc_spelling", "order_index", "first_response", "is_new", "is_finished", "present_state"},
-        "compact_study_day_patch_events": {"study_day_key", "snapshot_time", "voc_id", "event_type", "created_at"},
-        "snapshot_progress": {"snapshot_time", "study_day_key", "finished", "total", "study_time"},
-        "snapshots": {"snapshot_time", "study_day_key", "source", "api_success", "data_complete", "created_at"},
+        "words": {"word_key", "spelling", "voc_id", "first_seen_at", "last_seen_at"},
+        "records": {"study_day_key", "word_key", "snapshot_time", "voc_id", "spelling", "next_study_date", "study_count"},
+        "days": {"study_day_key", "snapshot_time", "record_count", "created_at"},
+        "record_events": {"study_day_key", "snapshot_time", "word_key", "voc_id", "event_type", "created_at"},
+        "study_items": {"study_day_key", "snapshot_time", "word_key", "voc_id", "voc_spelling", "order_index", "first_response", "is_new", "is_finished", "present_state"},
+        "study_events": {"study_day_key", "snapshot_time", "word_key", "voc_id", "event_type", "created_at"},
+        "progress": {"snapshot_time", "study_day_key", "finished", "total", "study_time"},
+        "snaps": {"snapshot_time", "study_day_key", "source", "api_success", "data_complete", "created_at"},
+        "reviews": {"word_key", "review_index", "review_day_key", "source_day_key", "study_count", "review_span_days", "interval_days"},
     }
     bad: list[str] = []
     for table, req in required_columns.items():
@@ -275,12 +410,7 @@ def setup_schema(conn: sqlite3.Connection) -> None:
         if miss:
             bad.append(f"{table} 缺少列 {miss}")
 
-    forbidden_columns = {
-        "words": {"word_key"},
-        "compact_overview_day_records": {"record_key", "raw_json", "tags_json"},
-        "compact_study_day_initial_items": {"item_key", "raw_json"},
-        "snapshot_progress": {"raw_json"},
-    }
+    forbidden_columns = {"records": {"record_key", "raw_json", "tags_json"}, "study_items": {"item_key", "raw_json"}, "progress": {"raw_json"}}
     for table, forbidden in forbidden_columns.items():
         cols = _compact_columns(conn, table)
         present = sorted(cols & forbidden)
@@ -288,11 +418,13 @@ def setup_schema(conn: sqlite3.Connection) -> None:
             bad.append(f"{table} 仍包含废弃列 {present}")
 
     if bad:
-        raise RuntimeError("SQLite compact_v3_voc_id schema 不完整: " + "; ".join(bad))
+        raise RuntimeError("SQLite compact_v4_word_key schema 不完整: " + "; ".join(bad))
 
-    row = conn.execute("SELECT value FROM compact_meta WHERE key='schema_version'").fetchone()
-    if not row or str(row["value"] if isinstance(row, sqlite3.Row) else row[0]) != COMPACT_SCHEMA_VERSION:
-        raise RuntimeError("SQLite schema_version 不是 compact_v3_voc_id，请重新同步生成最新版数据库。")
+    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    if not row:
+        conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", ("schema_version", COMPACT_SCHEMA_VERSION))
+    elif str(row["value"] if isinstance(row, sqlite3.Row) else row[0]) != COMPACT_SCHEMA_VERSION:
+        raise RuntimeError("SQLite schema_version 不是 compact_v4_word_key，请运行新版迁移。")
 
     conn.execute("PRAGMA optimize")
 
@@ -303,13 +435,13 @@ def setup_schema(conn: sqlite3.Connection) -> None:
 
 
 def _compact_latest_day(conn: sqlite3.Connection) -> str | None:
-    row = conn.execute("SELECT study_day_key FROM compact_overview_day_checkpoints ORDER BY study_day_key DESC LIMIT 1").fetchone()
+    row = conn.execute("SELECT study_day_key FROM days ORDER BY study_day_key DESC LIMIT 1").fetchone()
     if row:
         return str(row["study_day_key"])
     row = conn.execute(
         """
         SELECT study_day_key
-        FROM snapshots
+        FROM snaps
         WHERE COALESCE(data_complete,1)=1 AND COALESCE(api_success,1)=1
         ORDER BY study_day_key DESC, snapshot_time DESC
         LIMIT 1
@@ -323,8 +455,8 @@ def list_days(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
         """
         SELECT DISTINCT c.study_day_key
-        FROM compact_overview_day_checkpoints c
-        JOIN snapshots s ON s.snapshot_time=c.snapshot_time
+        FROM days c
+        JOIN snaps s ON s.snapshot_time=c.snapshot_time
         WHERE COALESCE(s.data_complete,1)=1 AND COALESCE(s.api_success,1)=1
         ORDER BY c.study_day_key
         """
@@ -334,7 +466,7 @@ def list_days(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
         """
         SELECT DISTINCT study_day_key
-        FROM snapshots
+        FROM snaps
         WHERE COALESCE(data_complete,1)=1 AND COALESCE(api_success,1)=1
         ORDER BY study_day_key
         """
@@ -354,8 +486,8 @@ def latest_snapshot_time_for_day(conn: sqlite3.Connection, study_day_key: str) -
     row = conn.execute(
         """
         SELECT c.snapshot_time
-        FROM compact_overview_day_checkpoints c
-        JOIN snapshots s ON s.snapshot_time=c.snapshot_time
+        FROM days c
+        JOIN snaps s ON s.snapshot_time=c.snapshot_time
         WHERE c.study_day_key=?
           AND COALESCE(s.data_complete, 1)=1
           AND COALESCE(s.api_success, 1)=1
@@ -370,7 +502,7 @@ def latest_snapshot_time_for_day(conn: sqlite3.Connection, study_day_key: str) -
     row = conn.execute(
         """
         SELECT snapshot_time
-        FROM snapshots
+        FROM snaps
         WHERE study_day_key=?
           AND COALESCE(data_complete, 1)=1
           AND COALESCE(api_success, 1)=1
@@ -387,8 +519,8 @@ def latest_snapshot_time(conn: sqlite3.Connection) -> str | None:
     row = conn.execute(
         """
         SELECT c.snapshot_time
-        FROM compact_overview_day_checkpoints c
-        JOIN snapshots s ON s.snapshot_time=c.snapshot_time
+        FROM days c
+        JOIN snaps s ON s.snapshot_time=c.snapshot_time
         WHERE COALESCE(s.data_complete,1)=1 AND COALESCE(s.api_success,1)=1
         ORDER BY c.study_day_key DESC, c.snapshot_time DESC
         LIMIT 1
@@ -399,7 +531,7 @@ def latest_snapshot_time(conn: sqlite3.Connection) -> str | None:
     row = conn.execute(
         """
         SELECT snapshot_time
-        FROM snapshots
+        FROM snaps
         WHERE COALESCE(data_complete,1)=1 AND COALESCE(api_success,1)=1
         ORDER BY snapshot_time DESC
         LIMIT 1
@@ -414,8 +546,10 @@ def latest_snapshot_time(conn: sqlite3.Connection) -> str | None:
 
 
 def _v3_overview_payload(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    word_key = row_value(row, "word_key") or row_value(row, "spelling") or ""
     return {
-        "record_key": row_value(row, "voc_id"),
+        "record_key": word_key,
+        "word_key": word_key,
         "voc_id": row_value(row, "voc_id"),
         "spelling": row_value(row, "spelling"),
         "add_date": row_value(row, "add_date"),
@@ -436,6 +570,7 @@ def _v3_overview_payload(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
 
 def _v3_study_item_to_api(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     return {
+        "word_key": row_value(row, "word_key") or row_value(row, "voc_spelling") or "",
         "voc_id": row_value(row, "voc_id"),
         "voc_spelling": row_value(row, "voc_spelling"),
         "order": row_value(row, "order_index"),
@@ -447,8 +582,10 @@ def _v3_study_item_to_api(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
 
 
 def _overview_state_row_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    word_key = payload.get("word_key") or payload.get("spelling") or ""
     return {
-        "record_key": payload.get("voc_id"),
+        "record_key": word_key,
+        "word_key": word_key,
         "voc_id": payload.get("voc_id"),
         "spelling": payload.get("spelling") or "",
         "add_date": payload.get("add_date"),
@@ -525,6 +662,7 @@ def _insert_patch_event(
     *,
     snapshot_time: str,
     study_day_key: str,
+    word_key: str,
     voc_id: str,
     event_type: str,
     values: dict[str, Any] | None = None,
@@ -543,27 +681,29 @@ def _insert_patch_event(
         })
 
     conn.execute(
-        f"DELETE FROM {table} WHERE snapshot_time=? AND voc_id=? AND event_type=?",
-        (snapshot_time, voc_id, event_type),
+        f"DELETE FROM {table} WHERE snapshot_time=? AND word_key=? AND event_type=?",
+        (snapshot_time, word_key, event_type),
     )
-    columns = ["snapshot_time", "study_day_key", "voc_id", "event_type", *safe_values.keys(), "created_at"]
+    columns = ["snapshot_time", "study_day_key", "word_key", "voc_id", "event_type", *safe_values.keys(), "created_at"]
     placeholders = ",".join("?" for _ in columns)
-    params = [snapshot_time, study_day_key, voc_id, event_type, *safe_values.values(), created_at]
+    params = [snapshot_time, study_day_key, word_key, voc_id, event_type, *safe_values.values(), created_at]
     conn.execute(f"INSERT INTO {table}({','.join(columns)}) VALUES({placeholders})", params)
 
 
 def _apply_patch_study_events(state: dict[str, dict[str, Any]], rows: list[sqlite3.Row]) -> int:
     applied = 0
     for ev in rows:
-        vid = str(ev["voc_id"] or "").strip()
-        if not vid:
+        key = str(ev["word_key"] or "").strip()
+        if not key:
             continue
         event_type = str(ev["event_type"] or "")
         if event_type == "record_removed":
-            state.pop(vid, None)
+            state.pop(key, None)
             applied += 1
             continue
-        cur = state.get(vid, {"voc_id": vid})
+        cur = state.get(key, {"word_key": key, "voc_id": row_value(ev, "voc_id")})
+        if row_value(ev, "voc_id") is not None:
+            cur["voc_id"] = row_value(ev, "voc_id")
         if event_type not in {"patch", "record_inserted"}:
             continue
         for field_name in STUDY_ITEM_EVENT_FIELDS:
@@ -571,40 +711,47 @@ def _apply_patch_study_events(state: dict[str, dict[str, Any]], rows: list[sqlit
             if value is not None:
                 cur[field_name] = _patch_event_cast(field_name, value)
         cur.setdefault("present_state", "observed")
-        state[vid] = cur
+        state[key] = cur
         applied += 1
     return applied
 
 
-def _reverse_compact_overview_events(conn: sqlite3.Connection, state: dict[str, dict[str, Any]], rows: list[sqlite3.Row]) -> None:
+def _reverse_record_events(conn: sqlite3.Connection, state: dict[str, dict[str, Any]], rows: list[sqlite3.Row]) -> None:
     if not rows:
         return
-    word_rows = conn.execute("SELECT voc_id, spelling FROM words").fetchall()
-    spelling_by_voc_id = {str(r["voc_id"]): (r["spelling"] or "") for r in word_rows if r["voc_id"]}
+    word_rows = conn.execute("SELECT word_key, spelling, voc_id FROM words").fetchall()
+    word_by_key = {str(r["word_key"]): r for r in word_rows if r["word_key"]}
     for ev in reversed(rows):
-        vid = str(ev["voc_id"] or "").strip()
-        if not vid:
+        key = str(ev["word_key"] or "").strip()
+        if not key:
             continue
         event_type = str(ev["event_type"] or "")
         old_values = {field: _patch_event_cast(field, row_value(ev, _overview_old_field(field))) for field in OVERVIEW_EVENT_FIELDS}
         has_old = any(row_value(ev, _overview_old_field(field)) is not None for field in OVERVIEW_EVENT_FIELDS)
         if event_type == "record_inserted":
-            state.pop(vid, None)
+            state.pop(key, None)
             continue
         if not has_old:
             continue
         if event_type == "record_removed":
-            state[vid] = _overview_state_row_from_payload({
-                "voc_id": vid,
-                "spelling": spelling_by_voc_id.get(vid, ""),
+            word_row = word_by_key.get(key)
+            state[key] = _overview_state_row_from_payload({
+                "word_key": key,
+                "voc_id": row_value(word_row, "voc_id") or row_value(ev, "voc_id"),
+                "spelling": row_value(word_row, "spelling") or key,
                 **old_values,
             })
             continue
         if event_type == "patch":
-            cur = state.get(vid) or _overview_state_row_from_payload({"voc_id": vid, "spelling": spelling_by_voc_id.get(vid, "")})
+            word_row = word_by_key.get(key)
+            cur = state.get(key) or _overview_state_row_from_payload({
+                "word_key": key,
+                "voc_id": row_value(word_row, "voc_id") or row_value(ev, "voc_id"),
+                "spelling": row_value(word_row, "spelling") or key,
+            })
             for field, value in old_values.items():
                 cur[field] = value
-            state[vid] = cur
+            state[key] = cur
 
 
 # ---------------------------------------------------------------------------
@@ -620,15 +767,15 @@ def reconstruct_study_day_items_at(
 ) -> list[dict[str, Any]]:
     setup_schema(conn)
     t = _trace_step_start()
-    cached = _cache_get("compact_v3_study_items", study_day_key, snapshot_time)
+    cached = _cache_get("study_items", study_day_key, snapshot_time)
     if cached is not None:
-        _trace_step_done(trace, "compact_v3_study_items_cache_hit", t, rows=len(cached))
+        _trace_step_done(trace, "study_items_cache_hit", t, rows=len(cached))
         return cached
 
     base = conn.execute(
         """
         SELECT snapshot_time
-        FROM compact_study_day_initial_items
+        FROM study_items
         WHERE study_day_key=? AND snapshot_time<=?
         ORDER BY snapshot_time DESC
         LIMIT 1
@@ -637,15 +784,15 @@ def reconstruct_study_day_items_at(
     ).fetchone()
 
     if not base:
-        _trace_step_done(trace, "compact_v3_study_reconstruct_no_baseline", t, rows=0)
-        _cache_put("compact_v3_study_items", study_day_key, snapshot_time, [])
+        _trace_step_done(trace, "study_reconstruct_no_baseline", t, rows=0)
+        _cache_put("study_items", study_day_key, snapshot_time, [])
         return []
 
     base_snapshot = str(base["snapshot_time"])
     rows = conn.execute(
         """
         SELECT *
-        FROM compact_study_day_initial_items
+        FROM study_items
         WHERE study_day_key=? AND snapshot_time=?
         ORDER BY order_index IS NULL, order_index, voc_spelling COLLATE NOCASE
         """,
@@ -654,11 +801,12 @@ def reconstruct_study_day_items_at(
 
     state: dict[str, dict[str, Any]] = {}
     for r in rows:
-        vid = str(r["voc_id"] or "").strip()
-        if not vid:
+        key = str(r["word_key"] or "").strip()
+        if not key:
             continue
-        state[vid] = {
-            "voc_id": vid,
+        state[key] = {
+            "word_key": key,
+            "voc_id": r["voc_id"],
             "voc_spelling": r["voc_spelling"],
             "order_index": r["order_index"],
             "first_response": r["first_response"],
@@ -671,7 +819,7 @@ def reconstruct_study_day_items_at(
     patch_changes = conn.execute(
         """
         SELECT *
-        FROM compact_study_day_patch_events
+        FROM study_events
         WHERE study_day_key=? AND snapshot_time>? AND snapshot_time<=?
         ORDER BY snapshot_time ASC, id ASC
         """,
@@ -681,8 +829,8 @@ def reconstruct_study_day_items_at(
 
     out = [_v3_study_item_to_api(x) for x in state.values()]
     out.sort(key=lambda x: (x.get("order") is None, x.get("order") if x.get("order") is not None else 10**12, (x.get("voc_spelling") or "").lower()))
-    _trace_step_done(trace, "compact_v3_study_reconstruct", t, baseline=base_snapshot, initial=initial_count, patchEvents=len(patch_changes), rows=len(out))
-    _cache_put("compact_v3_study_items", study_day_key, snapshot_time, out)
+    _trace_step_done(trace, "study_reconstruct", t, baseline=base_snapshot, initial=initial_count, patchEvents=len(patch_changes), rows=len(out))
+    _cache_put("study_items", study_day_key, snapshot_time, out)
     return out
 
 
@@ -694,24 +842,24 @@ def reconstruct_overview_records_at(
 ) -> list[dict[str, Any]]:
     setup_schema(conn)
     t = _trace_step_start()
-    cached = _cache_get("compact_v3_overview", study_day_key, snapshot_time)
+    cached = _cache_get("records", study_day_key, snapshot_time)
     if cached is not None:
-        _trace_step_done(trace, "compact_v3_overview_cache_hit", t, rows=len(cached))
+        _trace_step_done(trace, "records_cache_hit", t, rows=len(cached))
         return cached
 
     rows = conn.execute(
         """
         SELECT *
-        FROM compact_overview_day_records
+        FROM records
         WHERE study_day_key=?
         ORDER BY next_study_date, add_date, spelling COLLATE NOCASE
         """,
         (study_day_key,),
     ).fetchall()
-    state = {str(r["voc_id"]): _v3_overview_payload(r) for r in rows if r["voc_id"]}
+    state = {str(r["word_key"]): _v3_overview_payload(r) for r in rows if r["word_key"]}
 
     checkpoint = conn.execute(
-        "SELECT snapshot_time FROM compact_overview_day_checkpoints WHERE study_day_key=?",
+        "SELECT snapshot_time FROM days WHERE study_day_key=?",
         (study_day_key,),
     ).fetchone()
     latest_snapshot = str(checkpoint["snapshot_time"]) if checkpoint else None
@@ -720,18 +868,18 @@ def reconstruct_overview_records_at(
         patch_rows = conn.execute(
             """
             SELECT *
-            FROM compact_overview_patch_events
+            FROM record_events
             WHERE study_day_key=? AND snapshot_time>? AND snapshot_time<=?
             ORDER BY snapshot_time ASC, id ASC
             """,
             (study_day_key, snapshot_time, latest_snapshot),
         ).fetchall()
-        _reverse_compact_overview_events(conn, state, patch_rows)
+        _reverse_record_events(conn, state, patch_rows)
         reversed_events = len(patch_rows)
 
     out = sorted(state.values(), key=lambda x: (x.get("next_study_date") or "", x.get("add_date") or "", (x.get("spelling") or "").lower()))
-    _trace_step_done(trace, "compact_v3_overview_day_records_query", t, rows=len(out), latest=latest_snapshot, reversedEvents=reversed_events)
-    _cache_put("compact_v3_overview", study_day_key, snapshot_time, out)
+    _trace_step_done(trace, "records_day_records_query", t, rows=len(out), latest=latest_snapshot, reversedEvents=reversed_events)
+    _cache_put("records", study_day_key, snapshot_time, out)
     return out
 
 
@@ -774,8 +922,8 @@ def get_latest_progress_for_day_payload(
     row = conn.execute(
         """
         SELECT p.*
-        FROM snapshot_progress p
-        LEFT JOIN snapshots s ON s.snapshot_time=p.snapshot_time
+        FROM progress p
+        LEFT JOIN snaps s ON s.snapshot_time=p.snapshot_time
         WHERE p.study_day_key=?
           AND COALESCE(s.api_success, 1)=1
           AND COALESCE(s.data_complete, 1)=1
@@ -833,7 +981,7 @@ def build_dashboard_day_payload(
 
     t0 = time.perf_counter()
     progress_row = conn.execute(
-        "SELECT * FROM snapshot_progress WHERE study_day_key=? AND snapshot_time=?",
+        "SELECT * FROM progress WHERE study_day_key=? AND snapshot_time=?",
         (day, snapshot_time_value),
     ).fetchone() if snapshot_time_value else None
     progress = build_latest_progress_payload_from_items(progress_row, today_items) if progress_row and not _v3_progress_detail_missing(progress_row) else None
@@ -902,8 +1050,8 @@ def get_today_workspace(conn: sqlite3.Connection, day_key: str | None = None) ->
     rows = conn.execute(
         """
         SELECT p.*
-        FROM snapshot_progress p
-        LEFT JOIN snapshots s ON s.snapshot_time=p.snapshot_time
+        FROM progress p
+        LEFT JOIN snaps s ON s.snapshot_time=p.snapshot_time
         WHERE p.study_day_key=?
           AND COALESCE(s.api_success, 1)=1
           AND COALESCE(s.data_complete, 1)=1
@@ -912,7 +1060,7 @@ def get_today_workspace(conn: sqlite3.Connection, day_key: str | None = None) ->
         (day_key,),
     ).fetchall()
 
-    snapshots: list[dict[str, Any]] = []
+    snaps: list[dict[str, Any]] = []
     all_progress_lines: list[str] = []
     skipped_missing_detail = 0
 
@@ -992,7 +1140,7 @@ def get_today_workspace(conn: sqlite3.Connection, day_key: str | None = None) ->
             "summary": summary,
             "studyStatus": study_status,
         }
-        snapshots.append(snap)
+        snaps.append(snap)
         all_progress_lines.append(
             f"{display_name} | 已完成={summary['finished']} | 总数={summary['total']} | "
             f"今日首次忘记数={summary['firstForgetDone']} | 今日全部首次忘记数={summary['firstForgetAll']} | "
@@ -1003,12 +1151,12 @@ def get_today_workspace(conn: sqlite3.Connection, day_key: str | None = None) ->
             f"学习时长={summary['studyTimeMs'] / 1000:.0f}秒"
         )
 
-    error = "" if snapshots else f"未读取到 {day_key} 的有效数据库快照"
-    if skipped_missing_detail and snapshots:
+    error = "" if snaps else f"未读取到 {day_key} 的有效数据库快照"
+    if skipped_missing_detail and snaps:
         error = f"已跳过 {skipped_missing_detail} 个缺少今日单词明细的快照"
     return {
         "date": day_key,
-        "snapshots": snapshots,
+        "snaps": snaps,
         "allProgressText": "\n".join(all_progress_lines),
         "error": error,
         "skippedMissingDetailSnapshots": skipped_missing_detail,
@@ -1042,25 +1190,25 @@ def _diff_overview_removed_items(
 
 
 def _v3_today_missing_items_at_snapshot(conn: sqlite3.Connection, study_day_key: str, snapshot_time: str) -> list[dict[str, Any]]:
-    removed_ids: set[str] = set()
+    removed_keys: set[str] = set()
     narrow_rows = conn.execute(
         """
-        SELECT voc_id
-        FROM compact_study_day_patch_events
+        SELECT word_key
+        FROM study_events
         WHERE study_day_key=? AND snapshot_time=? AND event_type='record_removed'
         ORDER BY id ASC
         """,
         (study_day_key, snapshot_time),
     ).fetchall()
-    removed_ids.update(str(r["voc_id"] or "").strip() for r in narrow_rows if str(r["voc_id"] or "").strip())
+    removed_keys.update(str(r["word_key"] or "").strip() for r in narrow_rows if str(r["word_key"] or "").strip())
 
-    if not removed_ids:
+    if not removed_keys:
         return []
 
     prev = conn.execute(
         """
         SELECT snapshot_time
-        FROM snapshots
+        FROM snaps
         WHERE study_day_key=? AND snapshot_time<? AND COALESCE(api_success,1)=1 AND COALESCE(data_complete,1)=1
         ORDER BY snapshot_time DESC
         LIMIT 1
@@ -1068,14 +1216,14 @@ def _v3_today_missing_items_at_snapshot(conn: sqlite3.Connection, study_day_key:
         (study_day_key, snapshot_time),
     ).fetchone()
     previous_items = reconstruct_study_day_items_at(conn, study_day_key, str(prev["snapshot_time"])) if prev else []
-    previous_by_id = {str(x.get("voc_id") or "").strip(): x for x in previous_items if str(x.get("voc_id") or "").strip()}
+    previous_by_key = {str(x.get("word_key") or x.get("voc_spelling") or "").strip(): x for x in previous_items if str(x.get("word_key") or x.get("voc_spelling") or "").strip()}
 
-    out_by_id: dict[str, dict[str, Any]] = {}
-    for vid in removed_ids:
-        item = previous_by_id.get(vid, {"voc_id": vid})
-        out_by_id[vid] = {
+    out_by_key: dict[str, dict[str, Any]] = {}
+    for key in removed_keys:
+        item = previous_by_key.get(key, {"word_key": key})
+        out_by_key[key] = {
             "word": item.get("voc_spelling") or "",
-            "vocId": vid,
+            "vocId": item.get("voc_id") or "",
             "order": item.get("order"),
             "firstResponse": item.get("first_response") or "",
             "isNew": item.get("is_new"),
@@ -1083,7 +1231,7 @@ def _v3_today_missing_items_at_snapshot(conn: sqlite3.Connection, study_day_key:
             "presentState": "missing_candidate",
         }
 
-    out = list(out_by_id.values())
+    out = list(out_by_key.values())
     out.sort(key=lambda x: (x.get("order") is None, x.get("order") if x.get("order") is not None else 10**12, str(x.get("word") or "").lower()))
     return out
 
@@ -1093,7 +1241,7 @@ def get_latest_decrease_alerts(conn: sqlite3.Connection) -> list[dict[str, Any]]
     row = conn.execute(
         """
         SELECT snapshot_time, study_day_key
-        FROM snapshots
+        FROM snaps
         WHERE COALESCE(data_complete, 1)=1 AND COALESCE(api_success, 1)=1
         ORDER BY snapshot_time DESC
         LIMIT 1
@@ -1105,54 +1253,11 @@ def get_latest_decrease_alerts(conn: sqlite3.Connection) -> list[dict[str, Any]]
     study_day_key = row["study_day_key"]
     alerts: list[dict[str, Any]] = []
 
-    if _compact_table_exists(conn, "overview_snapshot_metrics"):
-        current_overview = conn.execute(
-            "SELECT total_count, record_count FROM overview_snapshot_metrics WHERE snapshot_time=?",
-            (snap_time,),
-        ).fetchone()
-        previous_overview = conn.execute(
-            """
-            SELECT snapshot_time, study_day_key, total_count, record_count
-            FROM overview_snapshot_metrics
-            WHERE snapshot_time < ?
-            ORDER BY snapshot_time DESC
-            LIMIT 1
-            """,
-            (snap_time,),
-        ).fetchone()
-        if current_overview and previous_overview:
-            current_count = _int_or_none(current_overview["total_count"])
-            previous_count = _int_or_none(previous_overview["total_count"])
-            if current_count is not None and previous_count is not None and current_count < previous_count:
-                delta = previous_count - current_count
-                removed_items, omitted = _limit_alert_items(
-                    _diff_overview_removed_items(
-                        conn,
-                        str(previous_overview["study_day_key"]),
-                        str(previous_overview["snapshot_time"]),
-                        str(study_day_key),
-                        str(snap_time),
-                    )
-                )
-                alerts.append({
-                    "type": "overview_count_decreased",
-                    "snapshotTime": snap_time,
-                    "studyDayKey": study_day_key,
-                    "previousSnapshotTime": previous_overview["snapshot_time"],
-                    "previousStudyDayKey": previous_overview["study_day_key"],
-                    "previousCount": previous_count,
-                    "currentCount": current_count,
-                    "count": delta,
-                    "items": removed_items,
-                    "itemsOmitted": omitted,
-                    "message": f"最新快照发现总览单词比上次减少 {delta} 个。是否是你主动删除了这些单词？",
-                })
-
-    current_progress = conn.execute("SELECT all_items_count, total FROM snapshot_progress WHERE snapshot_time=?", (snap_time,)).fetchone()
+    current_progress = conn.execute("SELECT all_items_count, total FROM progress WHERE snapshot_time=?", (snap_time,)).fetchone()
     previous_progress = conn.execute(
         """
         SELECT snapshot_time, all_items_count, total
-        FROM snapshot_progress
+        FROM progress
         WHERE study_day_key=? AND snapshot_time < ?
         ORDER BY snapshot_time DESC
         LIMIT 1
@@ -1292,7 +1397,7 @@ def query_words(conn: sqlite3.Connection, params: dict[str, Any]) -> dict[str, A
         return {
             "word": p.get("spelling") or "",
             "vocId": p.get("voc_id") or "",
-            "recordKey": p.get("voc_id") or "",
+            "recordKey": p.get("word_key") or p.get("spelling") or "",
             "currentState": p.get("current_state") or "",
             "isOverdue": p.get("is_overdue") or "",
             "studyCount": p.get("study_count"),
@@ -1313,27 +1418,27 @@ def query_words(conn: sqlite3.Connection, params: dict[str, Any]) -> dict[str, A
 
     if not today_filter and sort in sort_map:
         t = time.perf_counter()
-        total = int(conn.execute(f"SELECT COUNT(*) AS c FROM compact_overview_day_records{where_sql}", args).fetchone()["c"] or 0)
+        total = int(conn.execute(f"SELECT COUNT(*) AS c FROM records{where_sql}", args).fetchone()["c"] or 0)
         page_size = max(1, total or 1) if page_size_raw == "all" else max(1, min(nullable_int(page_size_raw) or 1000, 50000))
         offset = (page - 1) * page_size
         rows = conn.execute(
             f"""
             SELECT *
-            FROM compact_overview_day_records
+            FROM records
             {where_sql}
             ORDER BY {sql_sort} {direction}, spelling COLLATE NOCASE ASC
             LIMIT ? OFFSET ?
             """,
             [*args, page_size, offset],
         ).fetchall()
-        timings["compact_v3_sql_filter_page_ms"] = round((time.perf_counter() - t) * 1000, 2)
+        timings["sql_filter_page_ms"] = round((time.perf_counter() - t) * 1000, 2)
         items = []
         for r in rows:
             p = _v3_overview_payload(r)
             items.append(item_from_payload(p, _today_item_for_record(p, today_by_key, today_by_spelling)))
     else:
         t = time.perf_counter()
-        rows = conn.execute(f"SELECT * FROM compact_overview_day_records{where_sql}", args).fetchall()
+        rows = conn.execute(f"SELECT * FROM records{where_sql}", args).fetchall()
         records = [_v3_overview_payload(r) for r in rows]
         items = []
         for p in records:
@@ -1346,7 +1451,7 @@ def query_words(conn: sqlite3.Connection, params: dict[str, Any]) -> dict[str, A
         page_size = max(1, total or 1) if page_size_raw == "all" else max(1, min(nullable_int(page_size_raw) or 1000, 50000))
         offset = (page - 1) * page_size
         items = items[offset:offset + page_size]
-        timings["compact_v3_filter_page_ms"] = round((time.perf_counter() - t) * 1000, 2)
+        timings["filter_page_ms"] = round((time.perf_counter() - t) * 1000, 2)
 
     timings["total_db_ms"] = round((time.perf_counter() - total_start) * 1000, 2)
     return {
@@ -1372,7 +1477,7 @@ def get_local_word_index(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
     rows = conn.execute(
         """
         SELECT *
-        FROM compact_overview_day_records
+        FROM records
         WHERE study_day_key=? AND spelling IS NOT NULL AND spelling<>''
         ORDER BY spelling COLLATE NOCASE
         """,
@@ -1386,7 +1491,7 @@ def get_local_word_index(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
         out[key] = {
             "word": r["spelling"] or "",
             "vocId": r["voc_id"] or "",
-            "recordKey": r["voc_id"] or "",
+            "recordKey": r["word_key"] or r["spelling"] or "",
             "currentState": r["current_state"] or "",
             "isOverdue": r["is_overdue"] or "",
             "studyCount": r["study_count"],
@@ -1414,7 +1519,7 @@ def get_current_records_by_words(conn: sqlite3.Connection, words: list[str]) -> 
     rows = conn.execute(
         f"""
         SELECT *
-        FROM compact_overview_day_records
+        FROM records
         WHERE study_day_key=? AND lower(spelling) IN ({placeholders})
         """,
         [day, *wanted],
@@ -1428,7 +1533,7 @@ def get_current_records_by_words(conn: sqlite3.Connection, words: list[str]) -> 
         out.append({
             "word": r["spelling"] or "",
             "vocId": r["voc_id"] or "",
-            "recordKey": r["voc_id"] or "",
+            "recordKey": r["word_key"] or r["spelling"] or "",
             "currentState": r["current_state"] or "",
             "isOverdue": r["is_overdue"] or "",
             "studyCount": r["study_count"],
@@ -1444,18 +1549,20 @@ def get_current_records_by_words(conn: sqlite3.Connection, words: list[str]) -> 
 
 
 def _v3_upsert_word(conn: sqlite3.Connection, *, voc_id: str | None, spelling: str | None, captured_iso: str) -> None:
-    vid = str(voc_id or "").strip()
-    if not vid:
+    word_key = str(spelling or "").strip() or (f"voc:{str(voc_id).strip()}" if str(voc_id or "").strip() else "")
+    if not word_key:
         return
+    vid = str(voc_id or "").strip() or None
     conn.execute(
         """
-        INSERT INTO words(voc_id, spelling, first_seen_at, last_seen_at)
+        INSERT INTO words(word_key, spelling, voc_id, first_seen_at, last_seen_at)
         VALUES(?,?,?,?)
-        ON CONFLICT(voc_id) DO UPDATE SET
+        ON CONFLICT(word_key) DO UPDATE SET
+          voc_id=COALESCE(excluded.voc_id, words.voc_id),
           spelling=COALESCE(excluded.spelling, words.spelling),
           last_seen_at=excluded.last_seen_at
         """,
-        (vid, spelling, captured_iso, captured_iso),
+        (word_key, spelling or word_key, vid, captured_iso, captured_iso),
     )
 
 
@@ -1463,7 +1570,7 @@ def _v3_has_detail_today_items(*item_lists: list[dict[str, Any]] | None) -> bool
     return any(bool(x) for x in item_lists if x is not None)
 
 
-def _v3_insert_snapshot_progress(
+def _v3_insert_progress(
     conn: sqlite3.Connection,
     *,
     snapshot_time: str,
@@ -1524,7 +1631,7 @@ def _v3_insert_snapshot_progress(
     )
     conn.execute(
         """
-        INSERT OR REPLACE INTO snapshot_progress(
+        INSERT OR REPLACE INTO progress(
           snapshot_time, study_day_key, finished, total, study_time,
           first_forget_done, first_forget_all, vague_done, vague_all,
           familiar_done, familiar_all, new_words, review_words, pending_new_words,
@@ -1539,11 +1646,11 @@ def _v3_normalized_today_payloads(all_list: list[dict[str, Any]]) -> dict[str, d
     payloads: dict[str, dict[str, Any]] = {}
     for item in all_list:
         p = item_payload(item)
-        vid = str(p.get("voc_id") or "").strip()
-        if not vid:
+        key = str(p.get("word_key") or "").strip()
+        if not key:
             continue
         p["state_hash"] = item_state_hash(p)
-        payloads[vid] = p
+        payloads[key] = p
     return payloads
 
 
@@ -1559,19 +1666,20 @@ def _v3_insert_study_snapshot(
     for p in payloads.values():
         _v3_upsert_word(conn, voc_id=p.get("voc_id"), spelling=p.get("voc_spelling"), captured_iso=captured_iso)
 
-    has_initial = conn.execute("SELECT 1 FROM compact_study_day_initial_items WHERE study_day_key=? LIMIT 1", (study_day_key,)).fetchone() is not None
+    has_initial = conn.execute("SELECT 1 FROM study_items WHERE study_day_key=? LIMIT 1", (study_day_key,)).fetchone() is not None
     if not has_initial:
         for p in payloads.values():
             conn.execute(
                 """
-                INSERT INTO compact_study_day_initial_items(
-                  study_day_key, snapshot_time, voc_id, voc_spelling, order_index,
+                INSERT INTO study_items(
+                  study_day_key, snapshot_time, word_key, voc_id, voc_spelling, order_index,
                   first_response, is_new, is_finished, present_state, state_hash
-                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     study_day_key,
                     snapshot_time,
+                    p.get("word_key"),
                     p.get("voc_id"),
                     p.get("voc_spelling"),
                     p.get("order_index"),
@@ -1587,7 +1695,7 @@ def _v3_insert_study_snapshot(
     prev_snapshot = conn.execute(
         """
         SELECT snapshot_time
-        FROM snapshots
+        FROM snaps
         WHERE study_day_key=? AND snapshot_time<? AND COALESCE(data_complete,1)=1 AND COALESCE(api_success,1)=1
         ORDER BY snapshot_time DESC
         LIMIT 1
@@ -1596,13 +1704,14 @@ def _v3_insert_study_snapshot(
     ).fetchone()
     previous_ref_snapshot = prev_snapshot["snapshot_time"] if prev_snapshot else snapshot_time
     previous_items = reconstruct_study_day_items_at(conn, study_day_key, previous_ref_snapshot)
-    prev_by_id: dict[str, dict[str, Any]] = {}
+    prev_by_key: dict[str, dict[str, Any]] = {}
     for it in previous_items:
-        vid = str(it.get("voc_id") or "").strip()
-        if not vid:
+        key = str(it.get("word_key") or it.get("voc_spelling") or "").strip()
+        if not key:
             continue
-        prev_by_id[vid] = {
-            "voc_id": vid,
+        prev_by_key[key] = {
+            "word_key": key,
+            "voc_id": it.get("voc_id"),
             "voc_spelling": it.get("voc_spelling"),
             "order_index": it.get("order"),
             "first_response": it.get("first_response"),
@@ -1612,17 +1721,18 @@ def _v3_insert_study_snapshot(
         }
 
     changes = 0
-    current_ids = set(payloads)
-    for vid, p in payloads.items():
-        prev = prev_by_id.get(vid)
+    current_keys = set(payloads)
+    for key, p in payloads.items():
+        prev = prev_by_key.get(key)
         if prev is None:
             _insert_patch_event(
                 conn,
-                "compact_study_day_patch_events",
+                "study_events",
                 STUDY_ITEM_EVENT_FIELDS,
                 snapshot_time=snapshot_time,
                 study_day_key=study_day_key,
-                voc_id=vid,
+                word_key=key,
+                voc_id=str(p.get("voc_id") or ""),
                 event_type="record_inserted",
                 values={field: p.get(field) for field in STUDY_ITEM_EVENT_FIELDS},
                 created_at=captured_iso,
@@ -1634,27 +1744,29 @@ def _v3_insert_study_snapshot(
         if changed:
             _insert_patch_event(
                 conn,
-                "compact_study_day_patch_events",
+                "study_events",
                 STUDY_ITEM_EVENT_FIELDS,
                 snapshot_time=snapshot_time,
                 study_day_key=study_day_key,
-                voc_id=vid,
+                word_key=key,
+                voc_id=str(p.get("voc_id") or ""),
                 event_type="patch",
                 values=changed,
                 created_at=captured_iso,
             )
             changes += 1
 
-    for vid in prev_by_id:
-        if vid in current_ids:
+    for key, prev in prev_by_key.items():
+        if key in current_keys:
             continue
         _insert_patch_event(
             conn,
-            "compact_study_day_patch_events",
+            "study_events",
             STUDY_ITEM_EVENT_FIELDS,
             snapshot_time=snapshot_time,
             study_day_key=study_day_key,
-            voc_id=vid,
+            word_key=key,
+            voc_id=str(prev.get("voc_id") or ""),
             event_type="record_removed",
             values={},
             created_at=captured_iso,
@@ -1675,44 +1787,46 @@ def _v3_insert_overview_day(
     payloads: dict[str, dict[str, Any]] = {}
     for record in records:
         p = record_payload(record, study_day_key)
-        vid = str(p.get("voc_id") or "").strip()
-        if not vid:
+        key = str(p.get("word_key") or "").strip()
+        if not key:
             continue
         p["state_hash"] = record_state_hash(p)
-        payloads[vid] = p
-        _v3_upsert_word(conn, voc_id=vid, spelling=p.get("spelling"), captured_iso=captured_iso)
+        payloads[key] = p
+        _v3_upsert_word(conn, voc_id=p.get("voc_id"), spelling=p.get("spelling"), captured_iso=captured_iso)
 
-    previous_rows = conn.execute("SELECT * FROM compact_overview_day_records WHERE study_day_key=?", (study_day_key,)).fetchall()
-    previous = {str(r["voc_id"]): r for r in previous_rows if r["voc_id"]}
+    previous_rows = conn.execute("SELECT * FROM records WHERE study_day_key=?", (study_day_key,)).fetchall()
+    previous = {str(r["word_key"]): r for r in previous_rows if r["word_key"]}
     had_day_baseline = bool(previous)
     changes = 0
 
     if had_day_baseline:
-        for vid in sorted(set(previous) - set(payloads)):
+        for key in sorted(set(previous) - set(payloads)):
             _insert_patch_event(
                 conn,
-                "compact_overview_patch_events",
+                "record_events",
                 OVERVIEW_EVENT_FIELDS,
                 snapshot_time=snapshot_time,
                 study_day_key=study_day_key,
-                voc_id=vid,
+                word_key=key,
+                voc_id=str(row_value(previous[key], "voc_id") or ""),
                 event_type="record_removed",
                 values={},
-                old_values={field: row_value(previous[vid], field) for field in OVERVIEW_EVENT_FIELDS},
+                old_values={field: row_value(previous[key], field) for field in OVERVIEW_EVENT_FIELDS},
                 created_at=captured_iso,
             )
             changes += 1
 
-        for vid, p in payloads.items():
-            prev = previous.get(vid)
+        for key, p in payloads.items():
+            prev = previous.get(key)
             if prev is None:
                 _insert_patch_event(
                     conn,
-                    "compact_overview_patch_events",
+                    "record_events",
                     OVERVIEW_EVENT_FIELDS,
                     snapshot_time=snapshot_time,
                     study_day_key=study_day_key,
-                    voc_id=vid,
+                    word_key=key,
+                    voc_id=str(p.get("voc_id") or ""),
                     event_type="record_inserted",
                     values={field: p.get(field) for field in OVERVIEW_EVENT_FIELDS},
                     old_values={field: None for field in OVERVIEW_EVENT_FIELDS},
@@ -1725,11 +1839,12 @@ def _v3_insert_overview_day(
             if changed:
                 _insert_patch_event(
                     conn,
-                    "compact_overview_patch_events",
+                    "record_events",
                     OVERVIEW_EVENT_FIELDS,
                     snapshot_time=snapshot_time,
                     study_day_key=study_day_key,
-                    voc_id=vid,
+                    word_key=key,
+                    voc_id=str(p.get("voc_id") or ""),
                     event_type="patch",
                     values=changed,
                     old_values={field: row_value(prev, field) for field in OVERVIEW_EVENT_FIELDS},
@@ -1737,18 +1852,19 @@ def _v3_insert_overview_day(
                 )
                 changes += 1
 
-    conn.execute("DELETE FROM compact_overview_day_records WHERE study_day_key=?", (study_day_key,))
+    conn.execute("DELETE FROM records WHERE study_day_key=?", (study_day_key,))
     for p in payloads.values():
         conn.execute(
             """
-            INSERT INTO compact_overview_day_records(
-              study_day_key, snapshot_time, voc_id, spelling, add_date, first_study_date,
+            INSERT INTO records(
+              study_day_key, word_key, snapshot_time, voc_id, spelling, add_date, first_study_date,
               last_study_date, next_study_date, last_response, last_response_cn, study_count,
               tags_text, tag_well, tag_sticking, current_state, is_overdue, state_hash
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 study_day_key,
+                p.get("word_key"),
                 snapshot_time,
                 p.get("voc_id"),
                 p.get("spelling"),
@@ -1770,7 +1886,7 @@ def _v3_insert_overview_day(
 
     conn.execute(
         """
-        INSERT INTO compact_overview_day_checkpoints(study_day_key, snapshot_time, record_count, created_at)
+        INSERT INTO days(study_day_key, snapshot_time, record_count, created_at)
         VALUES(?,?,?,?)
         ON CONFLICT(study_day_key) DO UPDATE SET
           snapshot_time=excluded.snapshot_time,
@@ -1780,45 +1896,94 @@ def _v3_insert_overview_day(
         (study_day_key, snapshot_time, len(payloads), captured_iso),
     )
 
-    if _compact_table_exists(conn, "overview_snapshot_metrics"):
-        counts = {"total": len(payloads), "known": 0, "vague": 0, "forget": 0, "overdue": 0, "well": 0, "sticking": 0}
-        for p in payloads.values():
-            state = str(p.get("current_state") or "")
-            if state == "认识":
-                counts["known"] += 1
-            elif state == "模糊":
-                counts["vague"] += 1
-            elif state == "忘记":
-                counts["forget"] += 1
-            if p.get("is_overdue") == "是":
-                counts["overdue"] += 1
-            if p.get("tag_well") == "是":
-                counts["well"] += 1
-            if p.get("tag_sticking") == "是":
-                counts["sticking"] += 1
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO overview_snapshot_metrics(
-              snapshot_time, study_day_key, month_key, total_count, known_count, vague_count, forget_count,
-              overdue_count, well_known_count, sticking_count, record_count
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                snapshot_time,
-                study_day_key,
-                study_day_key[:7],
-                counts["total"],
-                counts["known"],
-                counts["vague"],
-                counts["forget"],
-                counts["overdue"],
-                counts["well"],
-                counts["sticking"],
-                len(payloads),
-            ),
-        )
     _RECONSTRUCT_CACHE.clear()
     return changes
+
+
+def rebuild_review_index(conn: sqlite3.Connection) -> int:
+    """Rebuild per-word review events from records."""
+    rows = conn.execute(
+        """
+        SELECT
+          study_day_key, snapshot_time, word_key, voc_id, spelling,
+          last_study_date, next_study_date, last_response, last_response_cn,
+          study_count, current_state, is_overdue, tags_text
+        FROM records
+        WHERE word_key IS NOT NULL AND word_key<>''
+          AND last_study_date IS NOT NULL AND last_study_date<>''
+        ORDER BY word_key, study_day_key
+        """
+    ).fetchall()
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    seen: set[tuple[str, str, str, str]] = set()
+    for row in rows:
+        word_key = str(row["word_key"] or "").strip()
+        review_day = _date_only(row["last_study_date"])
+        if not word_key or not review_day:
+            continue
+        study_count_text = "" if row["study_count"] is None else str(row["study_count"])
+        response = str(row["last_response"] or "")
+        event_key = (word_key, study_count_text, review_day, response)
+        if event_key in seen:
+            continue
+        seen.add(event_key)
+        next_day = _date_only(row["next_study_date"])
+        grouped.setdefault(word_key, []).append({
+            "review_day_key": review_day,
+            "source_day_key": row["study_day_key"],
+            "snapshot_time": row["snapshot_time"],
+            "voc_id": row["voc_id"],
+            "spelling": row["spelling"] or word_key,
+            "study_count": row["study_count"],
+            "last_response": row["last_response"],
+            "last_response_cn": row["last_response_cn"],
+            "next_study_day_key": next_day,
+            "review_span_days": _days_between_date_text(next_day, review_day),
+            "current_state": row["current_state"],
+            "is_overdue": row["is_overdue"],
+            "tags_text": row["tags_text"],
+        })
+
+    conn.execute("DELETE FROM reviews")
+    inserted = 0
+    for word_key, events in grouped.items():
+        events.sort(key=lambda e: (e["review_day_key"], e["study_count"] if e["study_count"] is not None else -1, e["source_day_key"]))
+        previous_day: str | None = None
+        for idx, event in enumerate(events, start=1):
+            interval_days = _days_between_date_text(event["review_day_key"], previous_day) if previous_day else None
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO reviews(
+                  word_key, review_index, review_day_key, source_day_key, snapshot_time,
+                  voc_id, spelling, study_count, last_response, last_response_cn,
+                  previous_review_day_key, next_study_day_key, interval_days, review_span_days,
+                  current_state, is_overdue, tags_text
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    word_key,
+                    idx,
+                    event["review_day_key"],
+                    event["source_day_key"],
+                    event["snapshot_time"],
+                    event["voc_id"],
+                    event["spelling"],
+                    event["study_count"],
+                    event["last_response"],
+                    event["last_response_cn"],
+                    previous_day,
+                    event["next_study_day_key"],
+                    interval_days,
+                    event["review_span_days"],
+                    event["current_state"],
+                    event["is_overdue"],
+                    event["tags_text"],
+                ),
+            )
+            previous_day = event["review_day_key"]
+            inserted += 1
+    return inserted
 
 
 def import_api_snapshot(
@@ -1856,12 +2021,12 @@ def import_api_snapshot(
 
     # Dangerous 04:00/rollover guard: progress can be positive while today_items
     # is empty. In that case, write only an incomplete marker and do not touch
-    # snapshot_progress, today-item tables, or overview checkpoints.
+    # progress, today-item tables, or overview checkpoints.
     if not has_detail_items and (progress_total > 0 or progress_finished > 0):
         reason = "today_items_empty_but_progress_present"
         conn.execute(
             """
-            INSERT INTO snapshots(snapshot_time, study_day_key, source, api_success, data_complete, incomplete_reason, created_at)
+            INSERT INTO snaps(snapshot_time, study_day_key, source, api_success, data_complete, incomplete_reason, created_at)
             VALUES(?,?,?,?,?,?,?)
             ON CONFLICT(snapshot_time) DO UPDATE SET
               study_day_key=excluded.study_day_key,
@@ -1872,8 +2037,8 @@ def import_api_snapshot(
             """,
             (snap_time, study_day_key, source, 0, 0, reason, created_iso),
         )
-        conn.execute("INSERT OR REPLACE INTO compact_meta(key,value) VALUES(?,?)", ("schema_version", COMPACT_SCHEMA_VERSION))
-        conn.execute("INSERT OR REPLACE INTO compact_meta(key,value) VALUES(?,?)", ("last_sync_at", created_iso))
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("schema_version", COMPACT_SCHEMA_VERSION))
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("last_sync_at", created_iso))
         conn.execute("PRAGMA optimize")
         _RECONSTRUCT_CACHE.clear()
         return ImportResult(
@@ -1888,7 +2053,7 @@ def import_api_snapshot(
 
     conn.execute(
         """
-        INSERT INTO snapshots(snapshot_time, study_day_key, source, api_success, data_complete, incomplete_reason, created_at)
+        INSERT INTO snaps(snapshot_time, study_day_key, source, api_success, data_complete, incomplete_reason, created_at)
         VALUES(?,?,?,?,?,?,?)
         ON CONFLICT(snapshot_time) DO UPDATE SET
           study_day_key=excluded.study_day_key,
@@ -1900,7 +2065,7 @@ def import_api_snapshot(
         (snap_time, study_day_key, source, 1, 1, None, created_iso),
     )
 
-    _v3_insert_snapshot_progress(
+    _v3_insert_progress(
         conn,
         snapshot_time=snap_time,
         study_day_key=study_day_key,
@@ -1925,9 +2090,11 @@ def import_api_snapshot(
         records=records,
         captured_iso=created_iso,
     ) if records else 0
+    if records:
+        rebuild_review_index(conn)
 
-    conn.execute("INSERT OR REPLACE INTO compact_meta(key,value) VALUES(?,?)", ("schema_version", COMPACT_SCHEMA_VERSION))
-    conn.execute("INSERT OR REPLACE INTO compact_meta(key,value) VALUES(?,?)", ("last_sync_at", created_iso))
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("schema_version", COMPACT_SCHEMA_VERSION))
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("last_sync_at", created_iso))
     conn.execute("PRAGMA optimize")
     _RECONSTRUCT_CACHE.clear()
 
@@ -1951,7 +2118,7 @@ def _light_overview_records_for_day(conn: sqlite3.Connection, day: str) -> list[
     rows = conn.execute(
         """
         SELECT *
-        FROM compact_overview_day_records
+        FROM records
         WHERE study_day_key=?
         ORDER BY next_study_date, add_date, spelling COLLATE NOCASE
         """,
@@ -1965,8 +2132,8 @@ def _light_latest_progress_row_for_day(conn: sqlite3.Connection, day: str, snaps
         row = conn.execute(
             """
             SELECT p.*
-            FROM snapshot_progress p
-            JOIN snapshots s ON s.snapshot_time=p.snapshot_time
+            FROM progress p
+            JOIN snaps s ON s.snapshot_time=p.snapshot_time
             WHERE p.study_day_key=?
               AND p.snapshot_time=?
               AND COALESCE(s.data_complete, 1)=1
@@ -1981,8 +2148,8 @@ def _light_latest_progress_row_for_day(conn: sqlite3.Connection, day: str, snaps
     rows = conn.execute(
         """
         SELECT p.*
-        FROM snapshot_progress p
-        JOIN snapshots s ON s.snapshot_time=p.snapshot_time
+        FROM progress p
+        JOIN snaps s ON s.snapshot_time=p.snapshot_time
         WHERE p.study_day_key=?
           AND COALESCE(s.data_complete, 1)=1
           AND COALESCE(s.api_success, 1)=1
@@ -2121,7 +2288,7 @@ def _light_page_memory_stats(
             - julianday(study_day_key)
             AS INTEGER
           ) AS critical_days
-        FROM compact_overview_day_records
+        FROM records
         WHERE study_day_key IN ({ph})
         ORDER BY study_day_key
         """,
@@ -2720,23 +2887,13 @@ def get_latest_snapshot_rows_as_overview_csv_dicts(
         trace.extend(today_trace)
 
     t = _trace_step_start()
-    today_by_id: dict[str, dict[str, Any]] = {}
-    today_by_spell: dict[str, dict[str, Any]] = {}
-    for item in today_items:
-        if item.get("voc_id"):
-            today_by_id[str(item["voc_id"])] = item
-        if item.get("voc_spelling"):
-            today_by_spell[str(item["voc_spelling"])] = item
-    _trace_step_done(trace, "overview_today_index_build", t, by_id=len(today_by_id), by_spell=len(today_by_spell))
+    today_by_key, today_by_spelling = _today_item_lookup(today_items)
+    _trace_step_done(trace, "overview_today_index_build", t, by_key=len(today_by_key), by_spell=len(today_by_spelling))
 
     t = _trace_step_start()
     out = []
     for p in records:
-        today = None
-        if p.get("voc_id"):
-            today = today_by_id.get(str(p["voc_id"]))
-        if today is None and p.get("spelling"):
-            today = today_by_spell.get(str(p["spelling"]))
+        today = _today_item_for_record(p, today_by_key, today_by_spelling)
         out.append(overview_payload_to_csv_row(p, today))
     _trace_step_done(trace, "overview_csv_rows_build", t, rows=len(out))
     return out
