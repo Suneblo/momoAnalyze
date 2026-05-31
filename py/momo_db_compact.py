@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Compact v3 SQLite storage implementation for MomoAnalyze.
 
-Only the latest compact_v3_voc_id schema is supported.  Legacy wide tables and
-migration compatibility paths were intentionally removed from this split.
+Only the latest compact_v3_voc_id schema is supported. Legacy wide tables and
+migration compatibility paths are intentionally not supported in this module.
 """
 
 from __future__ import annotations
@@ -10,12 +10,16 @@ from __future__ import annotations
 from momo_db_common import *
 
 
-def delete_latest_incomplete_snapshot(conn: sqlite3.Connection) -> dict[str, Any] | None:
-    """Delete only the latest snapshot when it is explicitly marked incomplete.
+# ---------------------------------------------------------------------------
+# Snapshot safety helpers
+# ---------------------------------------------------------------------------
 
-    This is intentionally conservative: complete historical snapshots are never
-    touched, and older incomplete markers are ignored unless they are the latest
-    snapshot in the database.
+
+def delete_latest_incomplete_snapshot(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    """Delete only the latest snapshot when it is explicitly incomplete.
+
+    Complete historical snapshots are never touched. Older incomplete markers are
+    ignored unless they are the latest snapshot in the database.
     """
     setup_schema(conn)
     row = conn.execute(
@@ -28,23 +32,30 @@ def delete_latest_incomplete_snapshot(conn: sqlite3.Connection) -> dict[str, Any
     ).fetchone()
     if not row:
         return None
+
     complete = conn.execute(
-        "SELECT COALESCE(data_complete, 1) AS data_complete, COALESCE(api_success, 1) AS api_success FROM snapshots WHERE snapshot_time=?",
+        """
+        SELECT COALESCE(data_complete, 1) AS data_complete,
+               COALESCE(api_success, 1) AS api_success
+        FROM snapshots
+        WHERE snapshot_time=?
+        """,
         (row["snapshot_time"],),
     ).fetchone()
     if complete and int(complete["data_complete"] or 0) == 1 and int(complete["api_success"] or 0) == 1:
         return None
-    info = {"snapshotTime": row["snapshot_time"], "studyDayKey": row["study_day_key"], "reason": row["incomplete_reason"] or ""}
+
+    info = {
+        "snapshotTime": row["snapshot_time"],
+        "studyDayKey": row["study_day_key"],
+        "reason": row["incomplete_reason"] or "",
+    }
     conn.execute("DELETE FROM snapshots WHERE snapshot_time=?", (row["snapshot_time"],))
     return info
 
 
 def record_incomplete_snapshot(conn: sqlite3.Connection, *, captured_at: datetime, source: str, reason: str) -> str:
-    """Record a failed/incomplete pull as a lightweight marker only.
-
-    No progress/items/overview rows are written for this marker. The next sync
-    will delete it first, then fetch again.
-    """
+    """Record a failed/incomplete pull as a lightweight marker only."""
     setup_schema(conn)
     study_day_key = study_day_key_from_dt(captured_at)
     snap_time = iso_bj(captured_at, milliseconds=True)
@@ -62,6 +73,11 @@ def record_incomplete_snapshot(conn: sqlite3.Connection, *, captured_at: datetim
         (snap_time, study_day_key, source, 0, 0, reason, iso_bj()),
     )
     return snap_time
+
+
+# ---------------------------------------------------------------------------
+# Small formatting / alert helpers
+# ---------------------------------------------------------------------------
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -102,317 +118,10 @@ def _today_alert_item(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _diff_overview_removed_items(conn: sqlite3.Connection, previous_day_key: str, previous_snapshot_time: str, current_day_key: str, current_snapshot_time: str) -> list[dict[str, Any]]:
-    try:
-        previous_records = reconstruct_overview_records_at(conn, previous_day_key, previous_snapshot_time)
-        current_records = reconstruct_overview_records_at(conn, current_day_key, current_snapshot_time)
-    except Exception:
-        return []
-    current_keys = {str(x.get("record_key") or record_key(x)) for x in current_records}
-    removed = []
-    for payload in previous_records:
-        key = str(payload.get("record_key") or record_key(payload))
-        if key not in current_keys:
-            removed.append(_overview_alert_item(payload))
-    return sorted(removed, key=lambda x: (x.get("word") or "", x.get("nextStudyDate") or ""))
-
-
-def _today_missing_items_at_snapshot(conn: sqlite3.Connection, study_day_key: str, snapshot_time: str) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        """
-        SELECT voc_id, voc_spelling, old_order_index, old_first_response, old_is_new, old_is_finished, new_present_state
-        FROM study_day_item_changes
-        WHERE study_day_key=? AND snapshot_time=? AND change_type='missing_candidate'
-        ORDER BY COALESCE(old_order_index, 1000000000), voc_spelling
-        """,
-        (study_day_key, snapshot_time),
-    ).fetchall()
-    out = []
-    for r in rows:
-        out.append({
-            "word": r["voc_spelling"] or "",
-            "vocId": r["voc_id"] or "",
-            "order": r["old_order_index"],
-            "firstResponse": r["old_first_response"] or "",
-            "isNew": None if r["old_is_new"] is None else bool(r["old_is_new"]),
-            "isFinished": None if r["old_is_finished"] is None else bool(r["old_is_finished"]),
-            "presentState": r["new_present_state"] or "missing_candidate",
-        })
-    return out
-
-
-def get_latest_progress_for_day_payload(conn: sqlite3.Connection, day_key: str, trace: list[dict[str, Any]] | None = None, trace_prefix: str = "progress") -> dict[str, Any] | None:
-    setup_schema(conn)
-    t = _trace_step_start()
-    row = conn.execute(
-        """
-        SELECT p.*
-        FROM snapshot_progress p
-        LEFT JOIN snapshots s ON s.snapshot_time=p.snapshot_time
-        WHERE p.study_day_key=?
-          AND COALESCE(s.api_success, 1)=1
-          AND COALESCE(s.data_complete, 1)=1
-          AND NOT (
-            COALESCE(p.all_items_count, 0)=0
-            AND COALESCE(p.done_items_count, 0)=0
-            AND COALESCE(p.todo_items_count, 0)=0
-            AND (COALESCE(p.total, 0)>0 OR COALESCE(p.finished, 0)>0)
-          )
-        ORDER BY p.snapshot_time DESC
-        LIMIT 1
-        """,
-        (day_key,),
-    ).fetchone()
-    _trace_step_done(trace, f"{trace_prefix}_latest_row_query", t, found=bool(row))
-    if not row:
-        return None
-
-    item_trace: list[dict[str, Any]] = []
-    t = _trace_step_start()
-    items = reconstruct_study_day_items_at(conn, day_key, row["snapshot_time"], trace=item_trace)
-    _trace_step_done(trace, f"{trace_prefix}_items_reconstruct_total", t, rows=len(items))
-    if trace is not None:
-        trace.extend(item_trace)
-    return build_latest_progress_payload_from_items(row, items)
-
-
-def overview_payload_to_csv_row(p: dict[str, Any], today_item: dict[str, Any] | None = None) -> dict[str, Any]:
-    return {
-        "voc_id": p.get("voc_id") or "",
-        "单词": p.get("spelling") or "",
-        "加入日期": p.get("add_date") or "",
-        "首次学习日期": p.get("first_study_date") or "",
-        "最近学习日期": p.get("last_study_date") or "",
-        "下次复习日期": p.get("next_study_date") or "",
-        "最近一次反应": p.get("last_response_cn") or "",
-        "学习次数": "" if p.get("study_count") is None else p.get("study_count"),
-        "标签": p.get("tags_text") or "",
-        "标签_熟知": p.get("tag_well") or "否",
-        "标签_顽固": p.get("tag_sticking") or "否",
-        "标签汇总": p.get("tags_text") or "",
-        "当前状态": p.get("current_state") or "",
-        "是否逾期": p.get("is_overdue") or "否",
-        "熟悉程度(推断)": p.get("current_state") or "",
-        "当日已新学": "是" if today_item and today_item.get("is_new") is True and today_item.get("is_finished") is True else "",
-        "当日已复习": "是" if today_item and today_item.get("is_new") is False and today_item.get("is_finished") is True else "",
-        "当日待新学": "是" if today_item and today_item.get("is_new") is True and today_item.get("is_finished") is not True else "",
-    }
-
-
-def row_to_overview_payload(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
-    if isinstance(row, sqlite3.Row):
-        keys = set(row.keys())
-        get = lambda k, default=None: row[k] if k in keys else default
-    else:
-        get = row.get
-    return {
-        "record_key": get("record_key"),
-        "voc_id": get("voc_id"),
-        "spelling": get("spelling"),
-        "add_date": get("add_date"),
-        "first_study_date": get("first_study_date"),
-        "last_study_date": get("last_study_date"),
-        "next_study_date": get("next_study_date"),
-        "last_response": get("last_response"),
-        "last_response_cn": get("last_response_cn"),
-        "study_count": get("study_count"),
-        "tags_json": get("tags_json"),
-        "tags_text": get("tags_text"),
-        "tag_well": get("tag_well"),
-        "tag_sticking": get("tag_sticking"),
-        "current_state": get("current_state"),
-        "is_overdue": get("is_overdue"),
-        "state_hash": get("state_hash"),
-        "raw_json": get("raw_json"),
-    }
-
-
-def get_latest_snapshot_rows_as_overview_csv_dicts(conn: sqlite3.Connection, day_key: str, trace: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    t = _trace_step_start()
-    snapshot_time_value = latest_snapshot_time_for_day(conn, day_key)
-    _trace_step_done(trace, "overview_day_snapshot_lookup", t, snapshot=snapshot_time_value)
-    if not snapshot_time_value:
-        return []
-
-    t = _trace_step_start()
-    records = reconstruct_overview_records_at(conn, day_key, snapshot_time_value, trace=trace)
-    _trace_step_done(trace, "overview_reconstruct_total", t, rows=len(records))
-
-    today_trace: list[dict[str, Any]] = []
-    t = _trace_step_start()
-    today_items = reconstruct_study_day_items_at(conn, day_key, snapshot_time_value, trace=today_trace)
-    _trace_step_done(trace, "overview_today_items_total", t, rows=len(today_items))
-    for item in today_trace:
-        trace.append(item) if trace is not None else None
-
-    t = _trace_step_start()
-    today_by_id: dict[str, dict[str, Any]] = {}
-    today_by_spell: dict[str, dict[str, Any]] = {}
-    for item in today_items:
-        if item.get("voc_id"):
-            today_by_id[str(item["voc_id"])] = item
-        if item.get("voc_spelling"):
-            today_by_spell[str(item["voc_spelling"])] = item
-    _trace_step_done(trace, "overview_today_index_build", t, by_id=len(today_by_id), by_spell=len(today_by_spell))
-
-    t = _trace_step_start()
-    out = []
-    for p in records:
-        today = None
-        if p.get("voc_id"):
-            today = today_by_id.get(str(p["voc_id"]))
-        if today is None and p.get("spelling"):
-            today = today_by_spell.get(str(p["spelling"]))
-        out.append(overview_payload_to_csv_row(p, today))
-    _trace_step_done(trace, "overview_csv_rows_build", t, rows=len(out))
-    return out
-
-
-def build_dashboard_day_payload(conn: sqlite3.Connection, day: str, include_rows: bool = False) -> dict[str, Any]:
-    day_start = time.perf_counter()
-    timings: dict[str, float] = {}
-    overview_trace: list[dict[str, Any]] = []
-    progress_trace: list[dict[str, Any]] = []
-
-    t0 = time.perf_counter()
-    snapshot_time_value = latest_snapshot_time_for_day(conn, day)
-    _trace_step_done(overview_trace, "overview_day_snapshot_lookup", t0, snapshot=snapshot_time_value)
-    records = reconstruct_overview_records_at(conn, day, snapshot_time_value, trace=overview_trace) if snapshot_time_value else []
-    timings["overview_rows_ms"] = round((time.perf_counter() - t0) * 1000, 2)
-
-    t0 = time.perf_counter()
-    today_items = reconstruct_study_day_items_at(conn, day, snapshot_time_value, trace=overview_trace) if snapshot_time_value else []
-    timings["today_items_ms"] = round((time.perf_counter() - t0) * 1000, 2)
-
-    t0 = time.perf_counter()
-    summary = build_dashboard_summary_from_records(records, today_items, day, snapshot_time_value)
-    timings["summary_ms"] = round((time.perf_counter() - t0) * 1000, 2)
-
-    t0 = time.perf_counter()
-    progress_row = conn.execute(
-        "SELECT * FROM snapshot_progress WHERE study_day_key=? AND snapshot_time=?",
-        (day, snapshot_time_value),
-    ).fetchone() if snapshot_time_value else None
-    progress = build_latest_progress_payload_from_items(progress_row, today_items) if progress_row else None
-    timings["latest_progress_ms"] = round((time.perf_counter() - t0) * 1000, 2)
-
-    overview_update_time = ""
-    if progress and progress.get("capturedAt"):
-        overview_update_time = str(progress["capturedAt"]).replace("T", " ").split("+")[0][-12:]
-
-    study_status = build_study_status_from_raw(day, records, today_items, progress_row, snapshot_time_value)
-
-    payload: dict[str, Any] = {
-        "date": day,
-        "summary": summary,
-        "overviewUpdateTime": overview_update_time,
-        "latestProgress": progress,
-        "studyStatus": study_status,
-        "timings": timings,
-        "trace": {
-            "overview": overview_trace,
-            "progress": progress_trace,
-        },
-        "rowCount": len(records),
-        "todayItemCount": len(today_items),
-    }
-    if include_rows:
-        t0 = time.perf_counter()
-        today_by_key, today_by_spelling = _today_item_lookup(today_items)
-        overview_rows = []
-        for p in records:
-            today = _today_item_for_record(p, today_by_key, today_by_spelling)
-            overview_rows.append(overview_payload_to_csv_row(p, today))
-        timings["overview_csv_rows_build"] = round((time.perf_counter() - t0) * 1000, 2)
-        payload["overviewRows"] = overview_rows
-    timings["total_day_ms"] = round((time.perf_counter() - day_start) * 1000, 2)
-    return payload
-
-
-def get_dashboard_data_page(conn: sqlite3.Connection, offset: int = 0, limit: int = 8, include_meta: bool = False, order: str = "asc", workspace_date: str | None = None) -> dict[str, Any]:
-    total_start = time.perf_counter()
-    timings: dict[str, float] = {}
-
-    t0 = time.perf_counter()
-    days = list_days(conn)
-    timings["list_days_ms"] = round((time.perf_counter() - t0) * 1000, 2)
-
-    if str(order or "asc").lower() == "desc":
-        days = list(reversed(days))
-    total = len(days)
-    safe_offset = max(0, int(offset or 0))
-    safe_limit = max(1, min(60, int(limit or 8)))
-    page_days = days[safe_offset:safe_offset + safe_limit]
-
-    t0 = time.perf_counter()
-    day_payloads = []
-    day_timings = []
-    for index, day in enumerate(page_days, start=1):
-        day_start = time.perf_counter()
-        payload_for_day = build_dashboard_day_payload(conn, day, include_rows=False)
-        elapsed_ms = round((time.perf_counter() - day_start) * 1000, 2)
-        one = {
-            "date": day,
-            "index": safe_offset + index,
-            "elapsed_ms": elapsed_ms,
-            "row_count": payload_for_day.get("rowCount"),
-            "today_item_count": payload_for_day.get("todayItemCount"),
-            "trace": payload_for_day.get("trace") or {},
-            **(payload_for_day.get("timings") or {}),
-        }
-        day_timings.append(one)
-        db_perf_log(
-            f"dashboard-day {one['index']}/{total} {day} "
-            f"rows={one.get('row_count')} todayItems={one.get('today_item_count')} "
-            f"overview={one.get('overview_rows_ms')}ms progress={one.get('latest_progress_ms')}ms total={elapsed_ms}ms"
-        )
-        for group_name, trace_items in (one.get("trace") or {}).items():
-            for step in trace_items:
-                extra = " ".join(f"{k}={v}" for k, v in step.items() if k not in ("step", "ms"))
-                db_perf_log(f"dashboard-day-detail {day} {group_name}.{step.get('step')}={step.get('ms')}ms" + (f" {extra}" if extra else ""))
-        day_payloads.append(payload_for_day)
-    timings["build_days_ms"] = round((time.perf_counter() - t0) * 1000, 2)
-
-    payload: dict[str, Any] = {
-        "success": True,
-        "source": "sqlite-v21-process-log",
-        "schemaVersion": SCHEMA_VERSION,
-        "studyDayBoundaryHour": STUDY_DAY_BOUNDARY_HOUR,
-        "offset": safe_offset,
-        "limit": safe_limit,
-        "order": "desc" if str(order or "asc").lower() == "desc" else "asc",
-        "total": total,
-        "loaded": len(page_days),
-        "nextOffset": safe_offset + len(page_days),
-        "hasMore": safe_offset + len(page_days) < total,
-        "days": day_payloads,
-        "dayTimings": day_timings,
-    }
-    if include_meta:
-        t0 = time.perf_counter()
-        payload["todayWorkspace"] = get_today_workspace(conn, day_key=workspace_date)
-        timings["today_workspace_ms"] = round((time.perf_counter() - t0) * 1000, 2)
-        t0 = time.perf_counter()
-        payload["alerts"] = get_latest_decrease_alerts(conn)
-        timings["alerts_ms"] = round((time.perf_counter() - t0) * 1000, 2)
-    timings["total_db_ms"] = round((time.perf_counter() - total_start) * 1000, 2)
-    payload["timings"] = timings
-    return payload
-
-
-def get_dashboard_data(conn: sqlite3.Connection) -> dict[str, Any]:
-    payload = get_dashboard_data_page(conn, 0, 1000000, include_meta=True)
-    payload.pop("offset", None)
-    payload.pop("limit", None)
-    payload.pop("total", None)
-    payload.pop("loaded", None)
-    payload.pop("nextOffset", None)
-    payload.pop("hasMore", None)
-    return payload
-
 # ---------------------------------------------------------------------------
 # Compact performance schema
 # ---------------------------------------------------------------------------
+
 
 COMPACT_SCHEMA_VERSION = "compact_v3_voc_id"
 COMPACT_REQUIRED_TABLES = {
@@ -427,14 +136,7 @@ COMPACT_REQUIRED_TABLES = {
     "words",
 }
 
-
-def _compact_table_exists(conn: sqlite3.Connection, name: str) -> bool:
-    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
-
-
-def _compact_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {str(r["name"] if isinstance(r, sqlite3.Row) else r[1]) for r in conn.execute(f"PRAGMA table_info({table})")}
-
+PATCH_EMPTY_MARKER = "enmpty"
 
 PATCH_EVENT_FIELD_TYPES = {
     "order_index": "int",
@@ -453,12 +155,7 @@ OVERVIEW_EVENT_FIELDS = (
     "tags_text",
     "is_overdue",
 )
-
 OVERVIEW_OLD_EVENT_FIELDS = tuple(f"old_{field}" for field in OVERVIEW_EVENT_FIELDS)
-
-
-def _overview_old_field(field_name: str) -> str:
-    return f"old_{field_name}"
 
 STUDY_ITEM_EVENT_FIELDS = (
     "voc_spelling",
@@ -470,15 +167,20 @@ STUDY_ITEM_EVENT_FIELDS = (
 )
 
 
-def _ensure_narrow_event_schema(conn: sqlite3.Connection) -> None:
-    """Create sparse patch event tables used by the runtime.
+def _compact_table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
 
-    Sparse patch rules:
-    - one row = one voc_id at one snapshot_time
-    - unchanged fields are omitted from INSERT and remain SQL NULL
-    - non-NULL fields are replayed by direct overwrite
-    - PATCH_EMPTY_MARKER represents a real empty/NULL value
-    """
+
+def _compact_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(r["name"] if isinstance(r, sqlite3.Row) else r[1]) for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _overview_old_field(field_name: str) -> str:
+    return f"old_{field_name}"
+
+
+def _ensure_narrow_event_schema(conn: sqlite3.Connection) -> None:
+    """Create sparse patch event tables used by the runtime."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS compact_overview_patch_events(
@@ -525,6 +227,7 @@ def _ensure_narrow_event_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+
     existing_overview_event_cols = _compact_columns(conn, "compact_overview_patch_events")
     overview_old_column_defs = {
         "old_last_study_date": "TEXT",
@@ -545,96 +248,6 @@ def _ensure_narrow_event_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_study_day_patch_events_voc ON compact_study_day_patch_events(voc_id)")
 
 
-PATCH_EMPTY_MARKER = "enmpty"
-
-
-def _patch_event_value(value: Any) -> Any:
-    if value is None:
-        return PATCH_EMPTY_MARKER
-    if isinstance(value, bool):
-        return 1 if value else 0
-    return value
-
-
-def _patch_event_cast(field_name: str, value: Any) -> Any:
-    if value == PATCH_EMPTY_MARKER:
-        return None
-    typ = PATCH_EVENT_FIELD_TYPES.get(str(field_name))
-    if typ == "int":
-        return nullable_int(value)
-    if typ == "bool_int":
-        return nullable_bool_int(value)
-    return value
-
-
-def _insert_patch_event(
-    conn: sqlite3.Connection,
-    table: str,
-    event_fields: Iterable[str],
-    *,
-    snapshot_time: str,
-    study_day_key: str,
-    voc_id: str,
-    event_type: str,
-    values: dict[str, Any] | None = None,
-    old_values: dict[str, Any] | None = None,
-    created_at: str,
-) -> None:
-    """Insert one sparse patch row.
-
-    values contains only fields that changed. Unchanged columns are not included
-    in the INSERT and therefore remain SQL NULL.
-    """
-    safe_values: dict[str, Any] = {}
-    allowed = set(event_fields)
-    if values:
-        safe_values = {k: _patch_event_value(v) for k, v in values.items() if k in allowed}
-    if old_values:
-        safe_values.update({
-            _overview_old_field(k): _patch_event_value(v)
-            for k, v in old_values.items()
-            if k in allowed
-        })
-
-    # Re-inserting the same event should not leave stale columns from a previous
-    # version of the patch, so replace the row atomically inside the caller's txn.
-    conn.execute(
-        f"DELETE FROM {table} WHERE snapshot_time=? AND voc_id=? AND event_type=?",
-        (snapshot_time, voc_id, event_type),
-    )
-    columns = ["snapshot_time", "study_day_key", "voc_id", "event_type", *safe_values.keys(), "created_at"]
-    placeholders = ",".join("?" for _ in columns)
-    params = [snapshot_time, study_day_key, voc_id, event_type, *safe_values.values(), created_at]
-    conn.execute(
-        f"INSERT INTO {table}({','.join(columns)}) VALUES({placeholders})",
-        params,
-    )
-
-
-def _apply_patch_study_events(state: dict[str, dict[str, Any]], rows: list[sqlite3.Row]) -> int:
-    applied = 0
-    for ev in rows:
-        vid = str(ev["voc_id"] or "").strip()
-        if not vid:
-            continue
-        event_type = str(ev["event_type"] or "")
-        if event_type == "record_removed":
-            state.pop(vid, None)
-            applied += 1
-            continue
-        cur = state.get(vid, {"voc_id": vid})
-        if event_type not in {"patch", "record_inserted"}:
-            continue
-        for field_name in STUDY_ITEM_EVENT_FIELDS:
-            value = ev[field_name]
-            if value is not None:
-                cur[field_name] = _patch_event_cast(field_name, value)
-        cur.setdefault("present_state", "observed")
-        state[vid] = cur
-        applied += 1
-    return applied
-
-
 def setup_schema(conn: sqlite3.Connection) -> None:
     _ensure_narrow_event_schema(conn)
     missing = sorted(t for t in COMPACT_REQUIRED_TABLES if not _compact_table_exists(conn, t))
@@ -644,6 +257,7 @@ def setup_schema(conn: sqlite3.Connection) -> None:
             + ", ".join(missing)
             + "。请重新同步生成最新版数据库。"
         )
+
     required_columns = {
         "words": {"voc_id", "spelling", "first_seen_at", "last_seen_at"},
         "compact_overview_day_records": {"study_day_key", "snapshot_time", "voc_id", "spelling", "next_study_date", "study_count"},
@@ -660,6 +274,7 @@ def setup_schema(conn: sqlite3.Connection) -> None:
         miss = sorted(req - cols)
         if miss:
             bad.append(f"{table} 缺少列 {miss}")
+
     forbidden_columns = {
         "words": {"word_key"},
         "compact_overview_day_records": {"record_key", "raw_json", "tags_json"},
@@ -671,25 +286,59 @@ def setup_schema(conn: sqlite3.Connection) -> None:
         present = sorted(cols & forbidden)
         if present:
             bad.append(f"{table} 仍包含废弃列 {present}")
+
     if bad:
         raise RuntimeError("SQLite compact_v3_voc_id schema 不完整: " + "; ".join(bad))
+
     row = conn.execute("SELECT value FROM compact_meta WHERE key='schema_version'").fetchone()
     if not row or str(row["value"] if isinstance(row, sqlite3.Row) else row[0]) != COMPACT_SCHEMA_VERSION:
         raise RuntimeError("SQLite schema_version 不是 compact_v3_voc_id，请重新同步生成最新版数据库。")
+
     conn.execute("PRAGMA optimize")
+
+
+# ---------------------------------------------------------------------------
+# Day / snapshot lookup
+# ---------------------------------------------------------------------------
 
 
 def _compact_latest_day(conn: sqlite3.Connection) -> str | None:
     row = conn.execute("SELECT study_day_key FROM compact_overview_day_checkpoints ORDER BY study_day_key DESC LIMIT 1").fetchone()
     if row:
         return str(row["study_day_key"])
-    row = conn.execute("SELECT study_day_key FROM snapshots WHERE COALESCE(data_complete,1)=1 AND COALESCE(api_success,1)=1 ORDER BY study_day_key DESC, snapshot_time DESC LIMIT 1").fetchone()
+    row = conn.execute(
+        """
+        SELECT study_day_key
+        FROM snapshots
+        WHERE COALESCE(data_complete,1)=1 AND COALESCE(api_success,1)=1
+        ORDER BY study_day_key DESC, snapshot_time DESC
+        LIMIT 1
+        """
+    ).fetchone()
     return str(row["study_day_key"]) if row else None
 
 
 def list_days(conn: sqlite3.Connection) -> list[str]:
     setup_schema(conn)
-    rows = conn.execute("SELECT study_day_key FROM compact_overview_day_checkpoints ORDER BY study_day_key").fetchall()
+    rows = conn.execute(
+        """
+        SELECT DISTINCT c.study_day_key
+        FROM compact_overview_day_checkpoints c
+        JOIN snapshots s ON s.snapshot_time=c.snapshot_time
+        WHERE COALESCE(s.data_complete,1)=1 AND COALESCE(s.api_success,1)=1
+        ORDER BY c.study_day_key
+        """
+    ).fetchall()
+    if rows:
+        return [str(r["study_day_key"]) for r in rows]
+    rows = conn.execute(
+        """
+        SELECT DISTINCT study_day_key
+        FROM snapshots
+        WHERE COALESCE(data_complete,1)=1 AND COALESCE(api_success,1)=1
+        ORDER BY study_day_key
+        """
+    ).fetchall()
     return [str(r["study_day_key"]) for r in rows]
 
 
@@ -700,20 +349,68 @@ def latest_day(conn: sqlite3.Connection) -> str | None:
 
 def latest_snapshot_time_for_day(conn: sqlite3.Connection, study_day_key: str) -> str | None:
     setup_schema(conn)
-    row = conn.execute("SELECT snapshot_time FROM compact_overview_day_checkpoints WHERE study_day_key=?", (study_day_key,)).fetchone()
+
+    # Prefer compact checkpoint only when the pointed snapshot is complete.
+    row = conn.execute(
+        """
+        SELECT c.snapshot_time
+        FROM compact_overview_day_checkpoints c
+        JOIN snapshots s ON s.snapshot_time=c.snapshot_time
+        WHERE c.study_day_key=?
+          AND COALESCE(s.data_complete, 1)=1
+          AND COALESCE(s.api_success, 1)=1
+        ORDER BY c.snapshot_time DESC
+        LIMIT 1
+        """,
+        (study_day_key,),
+    ).fetchone()
     if row:
         return str(row["snapshot_time"])
-    row = conn.execute("SELECT snapshot_time FROM snapshots WHERE study_day_key=? AND COALESCE(data_complete,1)=1 AND COALESCE(api_success,1)=1 ORDER BY snapshot_time DESC LIMIT 1", (study_day_key,)).fetchone()
+
+    row = conn.execute(
+        """
+        SELECT snapshot_time
+        FROM snapshots
+        WHERE study_day_key=?
+          AND COALESCE(data_complete, 1)=1
+          AND COALESCE(api_success, 1)=1
+        ORDER BY snapshot_time DESC
+        LIMIT 1
+        """,
+        (study_day_key,),
+    ).fetchone()
     return str(row["snapshot_time"]) if row else None
 
 
 def latest_snapshot_time(conn: sqlite3.Connection) -> str | None:
     setup_schema(conn)
-    row = conn.execute("SELECT snapshot_time FROM compact_overview_day_checkpoints ORDER BY study_day_key DESC LIMIT 1").fetchone()
+    row = conn.execute(
+        """
+        SELECT c.snapshot_time
+        FROM compact_overview_day_checkpoints c
+        JOIN snapshots s ON s.snapshot_time=c.snapshot_time
+        WHERE COALESCE(s.data_complete,1)=1 AND COALESCE(s.api_success,1)=1
+        ORDER BY c.study_day_key DESC, c.snapshot_time DESC
+        LIMIT 1
+        """
+    ).fetchone()
     if row:
         return str(row["snapshot_time"])
-    row = conn.execute("SELECT snapshot_time FROM snapshots WHERE COALESCE(data_complete,1)=1 AND COALESCE(api_success,1)=1 ORDER BY snapshot_time DESC LIMIT 1").fetchone()
+    row = conn.execute(
+        """
+        SELECT snapshot_time
+        FROM snapshots
+        WHERE COALESCE(data_complete,1)=1 AND COALESCE(api_success,1)=1
+        ORDER BY snapshot_time DESC
+        LIMIT 1
+        """
+    ).fetchone()
     return str(row["snapshot_time"]) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Payload transforms
+# ---------------------------------------------------------------------------
 
 
 def _v3_overview_payload(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
@@ -749,7 +446,6 @@ def _v3_study_item_to_api(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
     }
 
 
-
 def _overview_state_row_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "record_key": payload.get("voc_id"),
@@ -771,13 +467,116 @@ def _overview_state_row_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _reverse_compact_overview_events(conn: sqlite3.Connection, state: dict[str, dict[str, Any]], rows: list[sqlite3.Row]) -> None:
-    """Reverse sparse overview patch events from the latest day state to an older snapshot.
+def overview_payload_to_csv_row(p: dict[str, Any], today_item: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "voc_id": p.get("voc_id") or "",
+        "单词": p.get("spelling") or "",
+        "加入日期": p.get("add_date") or "",
+        "首次学习日期": p.get("first_study_date") or "",
+        "最近学习日期": p.get("last_study_date") or "",
+        "下次复习日期": p.get("next_study_date") or "",
+        "最近一次反应": p.get("last_response_cn") or "",
+        "学习次数": "" if p.get("study_count") is None else p.get("study_count"),
+        "标签": p.get("tags_text") or "",
+        "标签_熟知": p.get("tag_well") or "否",
+        "标签_顽固": p.get("tag_sticking") or "否",
+        "标签汇总": p.get("tags_text") or "",
+        "当前状态": p.get("current_state") or "",
+        "是否逾期": p.get("is_overdue") or "否",
+        "熟悉程度(推断)": p.get("current_state") or "",
+        "当日已新学": "是" if today_item and today_item.get("is_new") is True and today_item.get("is_finished") is True else "",
+        "当日已复习": "是" if today_item and today_item.get("is_new") is False and today_item.get("is_finished") is True else "",
+        "当日待新学": "是" if today_item and today_item.get("is_new") is True and today_item.get("is_finished") is not True else "",
+    }
 
-    Kept only for non-memory aggregate reconstruction.  Word-level memory
-    comparison uses _memory_state_from_day_history() and does not depend on
-    old_* columns.
-    """
+
+def row_to_overview_payload(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    return _v3_overview_payload(row)
+
+
+# ---------------------------------------------------------------------------
+# Patch event helpers
+# ---------------------------------------------------------------------------
+
+
+def _patch_event_value(value: Any) -> Any:
+    if value is None:
+        return PATCH_EMPTY_MARKER
+    if isinstance(value, bool):
+        return 1 if value else 0
+    return value
+
+
+def _patch_event_cast(field_name: str, value: Any) -> Any:
+    if value == PATCH_EMPTY_MARKER:
+        return None
+    typ = PATCH_EVENT_FIELD_TYPES.get(str(field_name))
+    if typ == "int":
+        return nullable_int(value)
+    if typ == "bool_int":
+        return nullable_bool_int(value)
+    return value
+
+
+def _insert_patch_event(
+    conn: sqlite3.Connection,
+    table: str,
+    event_fields: Iterable[str],
+    *,
+    snapshot_time: str,
+    study_day_key: str,
+    voc_id: str,
+    event_type: str,
+    values: dict[str, Any] | None = None,
+    old_values: dict[str, Any] | None = None,
+    created_at: str,
+) -> None:
+    safe_values: dict[str, Any] = {}
+    allowed = set(event_fields)
+    if values:
+        safe_values = {k: _patch_event_value(v) for k, v in values.items() if k in allowed}
+    if old_values:
+        safe_values.update({
+            _overview_old_field(k): _patch_event_value(v)
+            for k, v in old_values.items()
+            if k in allowed
+        })
+
+    conn.execute(
+        f"DELETE FROM {table} WHERE snapshot_time=? AND voc_id=? AND event_type=?",
+        (snapshot_time, voc_id, event_type),
+    )
+    columns = ["snapshot_time", "study_day_key", "voc_id", "event_type", *safe_values.keys(), "created_at"]
+    placeholders = ",".join("?" for _ in columns)
+    params = [snapshot_time, study_day_key, voc_id, event_type, *safe_values.values(), created_at]
+    conn.execute(f"INSERT INTO {table}({','.join(columns)}) VALUES({placeholders})", params)
+
+
+def _apply_patch_study_events(state: dict[str, dict[str, Any]], rows: list[sqlite3.Row]) -> int:
+    applied = 0
+    for ev in rows:
+        vid = str(ev["voc_id"] or "").strip()
+        if not vid:
+            continue
+        event_type = str(ev["event_type"] or "")
+        if event_type == "record_removed":
+            state.pop(vid, None)
+            applied += 1
+            continue
+        cur = state.get(vid, {"voc_id": vid})
+        if event_type not in {"patch", "record_inserted"}:
+            continue
+        for field_name in STUDY_ITEM_EVENT_FIELDS:
+            value = ev[field_name]
+            if value is not None:
+                cur[field_name] = _patch_event_cast(field_name, value)
+        cur.setdefault("present_state", "observed")
+        state[vid] = cur
+        applied += 1
+    return applied
+
+
+def _reverse_compact_overview_events(conn: sqlite3.Connection, state: dict[str, dict[str, Any]], rows: list[sqlite3.Row]) -> None:
     if not rows:
         return
     word_rows = conn.execute("SELECT voc_id, spelling FROM words").fetchall()
@@ -808,7 +607,17 @@ def _reverse_compact_overview_events(conn: sqlite3.Connection, state: dict[str, 
             state[vid] = cur
 
 
-def reconstruct_study_day_items_at(conn: sqlite3.Connection, study_day_key: str, snapshot_time: str, trace: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# Reconstruction APIs
+# ---------------------------------------------------------------------------
+
+
+def reconstruct_study_day_items_at(
+    conn: sqlite3.Connection,
+    study_day_key: str,
+    snapshot_time: str,
+    trace: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     setup_schema(conn)
     t = _trace_step_start()
     cached = _cache_get("compact_v3_study_items", study_day_key, snapshot_time)
@@ -816,10 +625,6 @@ def reconstruct_study_day_items_at(conn: sqlite3.Connection, study_day_key: str,
         _trace_step_done(trace, "compact_v3_study_items_cache_hit", t, rows=len(cached))
         return cached
 
-    # Use only the baseline that already existed at this snapshot.  The previous
-    # implementation loaded the day's initial_items without a snapshot_time
-    # bound, so early snapshots could accidentally see a future baseline; if
-    # that future baseline was missing, charts looked like all zeros.
     base = conn.execute(
         """
         SELECT snapshot_time
@@ -846,6 +651,7 @@ def reconstruct_study_day_items_at(conn: sqlite3.Connection, study_day_key: str,
         """,
         (study_day_key, base_snapshot),
     ).fetchall()
+
     state: dict[str, dict[str, Any]] = {}
     for r in rows:
         vid = str(r["voc_id"] or "").strip()
@@ -860,6 +666,7 @@ def reconstruct_study_day_items_at(conn: sqlite3.Connection, study_day_key: str,
             "is_finished": r["is_finished"],
             "present_state": r["present_state"] or "observed",
         }
+
     initial_count = len(state)
     patch_changes = conn.execute(
         """
@@ -878,7 +685,13 @@ def reconstruct_study_day_items_at(conn: sqlite3.Connection, study_day_key: str,
     _cache_put("compact_v3_study_items", study_day_key, snapshot_time, out)
     return out
 
-def reconstruct_overview_records_at(conn: sqlite3.Connection, study_day_key: str, snapshot_time: str, trace: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+
+def reconstruct_overview_records_at(
+    conn: sqlite3.Connection,
+    study_day_key: str,
+    snapshot_time: str,
+    trace: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     setup_schema(conn)
     t = _trace_step_start()
     cached = _cache_get("compact_v3_overview", study_day_key, snapshot_time)
@@ -922,8 +735,166 @@ def reconstruct_overview_records_at(conn: sqlite3.Connection, study_day_key: str
     return out
 
 
+# ---------------------------------------------------------------------------
+# Progress and dashboard day payloads
+# ---------------------------------------------------------------------------
+
+
+def _v3_snapshot_detail_item_count(row: sqlite3.Row | dict[str, Any] | None) -> int:
+    if row is None:
+        return 0
+    total = 0
+    for key in ("all_items_count", "done_items_count", "todo_items_count"):
+        value = nullable_int(row_value(row, key))
+        if value:
+            total += value
+    return total
+
+
+def _v3_progress_has_positive_total(row_or_progress: sqlite3.Row | dict[str, Any] | None) -> bool:
+    if row_or_progress is None:
+        return False
+    total = nullable_int(row_value(row_or_progress, "total"))
+    finished = nullable_int(row_value(row_or_progress, "finished"))
+    return bool((total or 0) > 0 or (finished or 0) > 0)
+
+
+def _v3_progress_detail_missing(row: sqlite3.Row | dict[str, Any] | None) -> bool:
+    return _v3_progress_has_positive_total(row) and _v3_snapshot_detail_item_count(row) <= 0
+
+
+def get_latest_progress_for_day_payload(
+    conn: sqlite3.Connection,
+    day_key: str,
+    trace: list[dict[str, Any]] | None = None,
+    trace_prefix: str = "progress",
+) -> dict[str, Any] | None:
+    setup_schema(conn)
+    t = _trace_step_start()
+    row = conn.execute(
+        """
+        SELECT p.*
+        FROM snapshot_progress p
+        LEFT JOIN snapshots s ON s.snapshot_time=p.snapshot_time
+        WHERE p.study_day_key=?
+          AND COALESCE(s.api_success, 1)=1
+          AND COALESCE(s.data_complete, 1)=1
+        ORDER BY p.snapshot_time DESC
+        LIMIT 20
+        """,
+        (day_key,),
+    ).fetchall()
+    selected = None
+    for candidate in row:
+        if not _v3_progress_detail_missing(candidate):
+            selected = candidate
+            break
+    _trace_step_done(trace, f"{trace_prefix}_latest_row_query", t, found=bool(selected))
+    if not selected:
+        return None
+
+    item_trace: list[dict[str, Any]] = []
+    t = _trace_step_start()
+    items = reconstruct_study_day_items_at(conn, day_key, selected["snapshot_time"], trace=item_trace)
+    _trace_step_done(trace, f"{trace_prefix}_items_reconstruct_total", t, rows=len(items))
+    if trace is not None:
+        trace.extend(item_trace)
+    return build_latest_progress_payload_from_items(selected, items)
+
+
 def get_latest_progress_for_day(conn: sqlite3.Connection, day_key: str, trace: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
     return get_latest_progress_for_day_payload(conn, day_key, trace=trace, trace_prefix="progress")
+
+
+def build_dashboard_day_payload(
+    conn: sqlite3.Connection,
+    day: str,
+    include_rows: bool = False,
+    memory_thresholds_text: str | None = None,
+) -> dict[str, Any]:
+    day_start = time.perf_counter()
+    timings: dict[str, float] = {}
+    overview_trace: list[dict[str, Any]] = []
+    progress_trace: list[dict[str, Any]] = []
+
+    t0 = time.perf_counter()
+    snapshot_time_value = latest_snapshot_time_for_day(conn, day)
+    _trace_step_done(overview_trace, "overview_day_snapshot_lookup", t0, snapshot=snapshot_time_value)
+    records = reconstruct_overview_records_at(conn, day, snapshot_time_value, trace=overview_trace) if snapshot_time_value else []
+    timings["overview_rows_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+    t0 = time.perf_counter()
+    today_items = reconstruct_study_day_items_at(conn, day, snapshot_time_value, trace=overview_trace) if snapshot_time_value else []
+    timings["today_items_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+    t0 = time.perf_counter()
+    summary = build_dashboard_summary_from_records(records, today_items, day, snapshot_time_value, memory_thresholds_text=memory_thresholds_text)
+    timings["summary_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+    t0 = time.perf_counter()
+    progress_row = conn.execute(
+        "SELECT * FROM snapshot_progress WHERE study_day_key=? AND snapshot_time=?",
+        (day, snapshot_time_value),
+    ).fetchone() if snapshot_time_value else None
+    progress = build_latest_progress_payload_from_items(progress_row, today_items) if progress_row and not _v3_progress_detail_missing(progress_row) else None
+    timings["latest_progress_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+    overview_update_time = ""
+    if progress and progress.get("capturedAt"):
+        overview_update_time = str(progress["capturedAt"]).replace("T", " ").split("+")[0][-12:]
+
+    study_status = build_study_status_from_raw(day, records, today_items, progress_row, snapshot_time_value)
+
+    payload: dict[str, Any] = {
+        "date": day,
+        "summary": summary,
+        "overviewUpdateTime": overview_update_time,
+        "latestProgress": progress,
+        "studyStatus": study_status,
+        "timings": timings,
+        "trace": {"overview": overview_trace, "progress": progress_trace},
+        "rowCount": len(records),
+        "todayItemCount": len(today_items),
+    }
+    if include_rows:
+        t0 = time.perf_counter()
+        today_by_key, today_by_spelling = _today_item_lookup(today_items)
+        overview_rows = []
+        for p in records:
+            today = _today_item_for_record(p, today_by_key, today_by_spelling)
+            overview_rows.append(overview_payload_to_csv_row(p, today))
+        timings["overview_csv_rows_build"] = round((time.perf_counter() - t0) * 1000, 2)
+        payload["overviewRows"] = overview_rows
+    timings["total_day_ms"] = round((time.perf_counter() - day_start) * 1000, 2)
+    return payload
+
+
+def get_dashboard_data_page(
+    conn: sqlite3.Connection,
+    offset: int = 0,
+    limit: int = 8,
+    order: str = "asc",
+    memory_thresholds_text: str | None = None,
+) -> dict[str, Any]:
+    return get_dashboard_data_page_light(conn, offset=offset, limit=limit, order=order, memory_thresholds_text=memory_thresholds_text)
+
+
+def get_dashboard_data(conn: sqlite3.Connection, memory_thresholds_text: str | None = None) -> dict[str, Any]:
+    page = get_dashboard_data_page_light(conn, offset=0, limit=200, order="asc", memory_thresholds_text=memory_thresholds_text)
+    return {
+        "success": True,
+        "source": page.get("source"),
+        "schemaVersion": page.get("schemaVersion"),
+        "studyDayBoundaryHour": page.get("studyDayBoundaryHour"),
+        "days": page.get("days") or [],
+        "total": page.get("total") or 0,
+        "timings": page.get("timings") or {},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Today workspace
+# ---------------------------------------------------------------------------
 
 
 def get_today_workspace(conn: sqlite3.Connection, day_key: str | None = None) -> dict[str, Any]:
@@ -940,11 +911,12 @@ def get_today_workspace(conn: sqlite3.Connection, day_key: str | None = None) ->
         """,
         (day_key,),
     ).fetchall()
+
     snapshots: list[dict[str, Any]] = []
     all_progress_lines: list[str] = []
     skipped_missing_detail = 0
+
     for row in rows:
-        # 跳过缺少 today_items 明细的异常快照，避免实时图表出现假零值。
         if _v3_progress_detail_missing(row):
             skipped_missing_detail += 1
             continue
@@ -958,6 +930,7 @@ def get_today_workspace(conn: sqlite3.Connection, day_key: str | None = None) ->
         active_items = [x for x in all_items if x.get("present_state") != "confirmed_absent"]
         done_items = [x for x in active_items if x.get("is_finished") is True]
         todo_items = [x for x in active_items if x.get("is_finished") is not True]
+
         progress = {"finished": row["finished"], "total": row["total"], "study_time": row["study_time"]}
         breakdown = progress_today_breakdown(all_items)
         study_status = build_study_status_from_raw(day_key, overview_records, all_items, row, row["snapshot_time"])
@@ -1041,6 +1014,33 @@ def get_today_workspace(conn: sqlite3.Connection, day_key: str | None = None) ->
         "skippedMissingDetailSnapshots": skipped_missing_detail,
     }
 
+
+# ---------------------------------------------------------------------------
+# Alerts
+# ---------------------------------------------------------------------------
+
+
+def _diff_overview_removed_items(
+    conn: sqlite3.Connection,
+    previous_day_key: str,
+    previous_snapshot_time: str,
+    current_day_key: str,
+    current_snapshot_time: str,
+) -> list[dict[str, Any]]:
+    try:
+        previous_records = reconstruct_overview_records_at(conn, previous_day_key, previous_snapshot_time)
+        current_records = reconstruct_overview_records_at(conn, current_day_key, current_snapshot_time)
+    except Exception:
+        return []
+    current_keys = {str(x.get("record_key") or record_key(x)) for x in current_records}
+    removed = []
+    for payload in previous_records:
+        key = str(payload.get("record_key") or record_key(payload))
+        if key not in current_keys:
+            removed.append(_overview_alert_item(payload))
+    return sorted(removed, key=lambda x: (x.get("word") or "", x.get("nextStudyDate") or ""))
+
+
 def _v3_today_missing_items_at_snapshot(conn: sqlite3.Connection, study_day_key: str, snapshot_time: str) -> list[dict[str, Any]]:
     removed_ids: set[str] = set()
     narrow_rows = conn.execute(
@@ -1061,8 +1061,9 @@ def _v3_today_missing_items_at_snapshot(conn: sqlite3.Connection, study_day_key:
         """
         SELECT snapshot_time
         FROM snapshots
-        WHERE study_day_key=? AND snapshot_time<? AND COALESCE(api_success,1)=1
-        ORDER BY snapshot_time DESC LIMIT 1
+        WHERE study_day_key=? AND snapshot_time<? AND COALESCE(api_success,1)=1 AND COALESCE(data_complete,1)=1
+        ORDER BY snapshot_time DESC
+        LIMIT 1
         """,
         (study_day_key, snapshot_time),
     ).fetchone()
@@ -1105,26 +1106,83 @@ def get_latest_decrease_alerts(conn: sqlite3.Connection) -> list[dict[str, Any]]
     alerts: list[dict[str, Any]] = []
 
     if _compact_table_exists(conn, "overview_snapshot_metrics"):
-        current_overview = conn.execute("SELECT total_count, record_count FROM overview_snapshot_metrics WHERE snapshot_time=?", (snap_time,)).fetchone()
-        previous_overview = conn.execute("SELECT snapshot_time, study_day_key, total_count, record_count FROM overview_snapshot_metrics WHERE snapshot_time < ? ORDER BY snapshot_time DESC LIMIT 1", (snap_time,)).fetchone()
+        current_overview = conn.execute(
+            "SELECT total_count, record_count FROM overview_snapshot_metrics WHERE snapshot_time=?",
+            (snap_time,),
+        ).fetchone()
+        previous_overview = conn.execute(
+            """
+            SELECT snapshot_time, study_day_key, total_count, record_count
+            FROM overview_snapshot_metrics
+            WHERE snapshot_time < ?
+            ORDER BY snapshot_time DESC
+            LIMIT 1
+            """,
+            (snap_time,),
+        ).fetchone()
         if current_overview and previous_overview:
             current_count = _int_or_none(current_overview["total_count"])
             previous_count = _int_or_none(previous_overview["total_count"])
             if current_count is not None and previous_count is not None and current_count < previous_count:
                 delta = previous_count - current_count
-                removed_items, omitted = _limit_alert_items(_diff_overview_removed_items(conn, str(previous_overview["study_day_key"]), str(previous_overview["snapshot_time"]), str(study_day_key), str(snap_time)))
-                alerts.append({"type": "overview_count_decreased", "snapshotTime": snap_time, "studyDayKey": study_day_key, "previousSnapshotTime": previous_overview["snapshot_time"], "previousStudyDayKey": previous_overview["study_day_key"], "previousCount": previous_count, "currentCount": current_count, "count": delta, "items": removed_items, "itemsOmitted": omitted, "message": f"最新快照发现总览单词比上次减少 {delta} 个。是否是你主动删除了这些单词？"})
+                removed_items, omitted = _limit_alert_items(
+                    _diff_overview_removed_items(
+                        conn,
+                        str(previous_overview["study_day_key"]),
+                        str(previous_overview["snapshot_time"]),
+                        str(study_day_key),
+                        str(snap_time),
+                    )
+                )
+                alerts.append({
+                    "type": "overview_count_decreased",
+                    "snapshotTime": snap_time,
+                    "studyDayKey": study_day_key,
+                    "previousSnapshotTime": previous_overview["snapshot_time"],
+                    "previousStudyDayKey": previous_overview["study_day_key"],
+                    "previousCount": previous_count,
+                    "currentCount": current_count,
+                    "count": delta,
+                    "items": removed_items,
+                    "itemsOmitted": omitted,
+                    "message": f"最新快照发现总览单词比上次减少 {delta} 个。是否是你主动删除了这些单词？",
+                })
 
     current_progress = conn.execute("SELECT all_items_count, total FROM snapshot_progress WHERE snapshot_time=?", (snap_time,)).fetchone()
-    previous_progress = conn.execute("SELECT snapshot_time, all_items_count, total FROM snapshot_progress WHERE study_day_key=? AND snapshot_time < ? ORDER BY snapshot_time DESC LIMIT 1", (study_day_key, snap_time)).fetchone()
+    previous_progress = conn.execute(
+        """
+        SELECT snapshot_time, all_items_count, total
+        FROM snapshot_progress
+        WHERE study_day_key=? AND snapshot_time < ?
+        ORDER BY snapshot_time DESC
+        LIMIT 1
+        """,
+        (study_day_key, snap_time),
+    ).fetchone()
     if current_progress and previous_progress:
         current_items = _int_or_none(current_progress["all_items_count"])
         previous_items = _int_or_none(previous_progress["all_items_count"])
         if current_items is not None and previous_items is not None and current_items < previous_items:
             delta = previous_items - current_items
             missing_items, omitted = _limit_alert_items(_v3_today_missing_items_at_snapshot(conn, str(study_day_key), str(snap_time)))
-            alerts.append({"type": "today_item_count_decreased", "snapshotTime": snap_time, "studyDayKey": study_day_key, "previousSnapshotTime": previous_progress["snapshot_time"], "previousCount": previous_items, "currentCount": current_items, "count": delta, "items": missing_items, "itemsOmitted": omitted, "message": f"最新快照发现今日学习单词比上次少 {delta} 个。是否是你主动调整/删除了今日任务？"})
+            alerts.append({
+                "type": "today_item_count_decreased",
+                "snapshotTime": snap_time,
+                "studyDayKey": study_day_key,
+                "previousSnapshotTime": previous_progress["snapshot_time"],
+                "previousCount": previous_items,
+                "currentCount": current_items,
+                "count": delta,
+                "items": missing_items,
+                "itemsOmitted": omitted,
+                "message": f"最新快照发现今日学习单词比上次少 {delta} 个。是否是你主动调整/删除了今日任务？",
+            })
     return alerts
+
+
+# ---------------------------------------------------------------------------
+# Word query APIs
+# ---------------------------------------------------------------------------
 
 
 def query_words(conn: sqlite3.Connection, params: dict[str, Any]) -> dict[str, Any]:
@@ -1291,7 +1349,19 @@ def query_words(conn: sqlite3.Connection, params: dict[str, Any]) -> dict[str, A
         timings["compact_v3_filter_page_ms"] = round((time.perf_counter() - t) * 1000, 2)
 
     timings["total_db_ms"] = round((time.perf_counter() - total_start) * 1000, 2)
-    return {"success": True, "date": day_key, "snapshotTime": snapshot_time_value, "total": total, "page": page, "pageSize": page_size, "items": items, "todayItemCount": len(today_items), "recordCount": total, "timings": timings, "availableColumns": available_columns()}
+    return {
+        "success": True,
+        "date": day_key,
+        "snapshotTime": snapshot_time_value,
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
+        "items": items,
+        "todayItemCount": len(today_items),
+        "recordCount": total,
+        "timings": timings,
+        "availableColumns": available_columns(),
+    }
 
 
 def get_local_word_index(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
@@ -1301,7 +1371,8 @@ def get_local_word_index(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
         return {}
     rows = conn.execute(
         """
-        SELECT * FROM compact_overview_day_records
+        SELECT *
+        FROM compact_overview_day_records
         WHERE study_day_key=? AND spelling IS NOT NULL AND spelling<>''
         ORDER BY spelling COLLATE NOCASE
         """,
@@ -1312,7 +1383,16 @@ def get_local_word_index(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
         key = str(r["spelling"] or "").strip().lower()
         if not key or key in out:
             continue
-        out[key] = {"word": r["spelling"] or "", "vocId": r["voc_id"] or "", "recordKey": r["voc_id"] or "", "currentState": r["current_state"] or "", "isOverdue": r["is_overdue"] or "", "studyCount": r["study_count"], "nextStudyDate": r["next_study_date"] or "", "tags": r["tags_text"] or ""}
+        out[key] = {
+            "word": r["spelling"] or "",
+            "vocId": r["voc_id"] or "",
+            "recordKey": r["voc_id"] or "",
+            "currentState": r["current_state"] or "",
+            "isOverdue": r["is_overdue"] or "",
+            "studyCount": r["study_count"],
+            "nextStudyDate": r["next_study_date"] or "",
+            "tags": r["tags_text"] or "",
+        }
     return out
 
 
@@ -1333,7 +1413,8 @@ def get_current_records_by_words(conn: sqlite3.Connection, words: list[str]) -> 
     placeholders = ",".join(["?"] * len(wanted))
     rows = conn.execute(
         f"""
-        SELECT * FROM compact_overview_day_records
+        SELECT *
+        FROM compact_overview_day_records
         WHERE study_day_key=? AND lower(spelling) IN ({placeholders})
         """,
         [day, *wanted],
@@ -1344,8 +1425,22 @@ def get_current_records_by_words(conn: sqlite3.Connection, words: list[str]) -> 
         r = by_word.get(k)
         if not r:
             continue
-        out.append({"word": r["spelling"] or "", "vocId": r["voc_id"] or "", "recordKey": r["voc_id"] or "", "currentState": r["current_state"] or "", "isOverdue": r["is_overdue"] or "", "studyCount": r["study_count"], "nextStudyDate": r["next_study_date"] or "", "tags": r["tags_text"] or ""})
+        out.append({
+            "word": r["spelling"] or "",
+            "vocId": r["voc_id"] or "",
+            "recordKey": r["voc_id"] or "",
+            "currentState": r["current_state"] or "",
+            "isOverdue": r["is_overdue"] or "",
+            "studyCount": r["study_count"],
+            "nextStudyDate": r["next_study_date"] or "",
+            "tags": r["tags_text"] or "",
+        })
     return out
+
+
+# ---------------------------------------------------------------------------
+# Import/write path
+# ---------------------------------------------------------------------------
 
 
 def _v3_upsert_word(conn: sqlite3.Connection, *, voc_id: str | None, spelling: str | None, captured_iso: str) -> None:
@@ -1364,54 +1459,23 @@ def _v3_upsert_word(conn: sqlite3.Connection, *, voc_id: str | None, spelling: s
     )
 
 
-
 def _v3_has_detail_today_items(*item_lists: list[dict[str, Any]] | None) -> bool:
-    """Whether this snapshot contains real today-item detail rows.
-
-    Some Momo API calls return only the progress object during the 04:00 day
-    rollover window.  Writing response/new/review counters from an empty item
-    list creates false zero snapshots, so item-derived counters are considered
-    valid only when at least one today-item list is present.
-    """
     return any(bool(x) for x in item_lists if x is not None)
 
 
-def _v3_snapshot_detail_item_count(row: sqlite3.Row | dict[str, Any] | None) -> int:
-    if row is None:
-        return 0
-    total = 0
-    for key in ("all_items_count", "done_items_count", "todo_items_count"):
-        value = nullable_int(row_value(row, key))
-        if value:
-            total += value
-    return total
-
-
-def _v3_progress_has_positive_total(row_or_progress: sqlite3.Row | dict[str, Any] | None) -> bool:
-    if row_or_progress is None:
-        return False
-    total = nullable_int(row_value(row_or_progress, "total"))
-    finished = nullable_int(row_value(row_or_progress, "finished"))
-    return bool((total or 0) > 0 or (finished or 0) > 0)
-
-
-def _v3_progress_detail_missing(row: sqlite3.Row | dict[str, Any] | None) -> bool:
-    """True when a progress row has progress numbers but no item detail.
-
-    Existing databases may already contain these rows marked complete.  Readers
-    must skip them for realtime snapshot charts; otherwise all item-derived
-    fields become 0 even though the API simply did not provide item details.
-    """
-    return _v3_progress_has_positive_total(row) and _v3_snapshot_detail_item_count(row) <= 0
-
-
-def _v3_insert_snapshot_progress(conn: sqlite3.Connection, *, snapshot_time: str, study_day_key: str, progress: dict[str, Any], all_list: list[dict[str, Any]], done_list: list[dict[str, Any]], todo_list: list[dict[str, Any]]) -> None:
+def _v3_insert_snapshot_progress(
+    conn: sqlite3.Connection,
+    *,
+    snapshot_time: str,
+    study_day_key: str,
+    progress: dict[str, Any],
+    all_list: list[dict[str, Any]],
+    done_list: list[dict[str, Any]],
+    todo_list: list[dict[str, Any]],
+) -> None:
     p = extract_progress(progress)
     has_detail_items = _v3_has_detail_today_items(all_list, done_list, todo_list)
 
-    # Progress itself can exist without item detail.  In that case keep the raw
-    # finished/total/study_time but do NOT synthesize response/new/review
-    # counters from an empty list.  Those fields would be false zeros.
     if has_detail_items:
         first_forget_done = count_response(done_list, "FORGET")
         first_forget_all = count_response(all_list, "FORGET")
@@ -1470,6 +1534,7 @@ def _v3_insert_snapshot_progress(conn: sqlite3.Connection, *, snapshot_time: str
         values,
     )
 
+
 def _v3_normalized_today_payloads(all_list: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     payloads: dict[str, dict[str, Any]] = {}
     for item in all_list:
@@ -1482,16 +1547,14 @@ def _v3_normalized_today_payloads(all_list: list[dict[str, Any]]) -> dict[str, d
     return payloads
 
 
-def _v3_event_changed(prev: dict[str, Any] | None, p: dict[str, Any]) -> bool:
-    if prev is None:
-        return True
-    for f in ("first_response", "is_new", "is_finished", "present_state"):
-        if prev.get(f) != p.get(f):
-            return True
-    return False
-
-
-def _v3_insert_study_snapshot(conn: sqlite3.Connection, *, study_day_key: str, snapshot_time: str, all_list: list[dict[str, Any]], captured_iso: str) -> int:
+def _v3_insert_study_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    study_day_key: str,
+    snapshot_time: str,
+    all_list: list[dict[str, Any]],
+    captured_iso: str,
+) -> int:
     payloads = _v3_normalized_today_payloads(all_list)
     for p in payloads.values():
         _v3_upsert_word(conn, voc_id=p.get("voc_id"), spelling=p.get("voc_spelling"), captured_iso=captured_iso)
@@ -1506,15 +1569,28 @@ def _v3_insert_study_snapshot(conn: sqlite3.Connection, *, study_day_key: str, s
                   first_response, is_new, is_finished, present_state, state_hash
                 ) VALUES(?,?,?,?,?,?,?,?,?,?)
                 """,
-                (study_day_key, snapshot_time, p.get("voc_id"), p.get("voc_spelling"), p.get("order_index"), p.get("first_response"), p.get("is_new"), p.get("is_finished"), p.get("present_state"), p.get("state_hash")),
+                (
+                    study_day_key,
+                    snapshot_time,
+                    p.get("voc_id"),
+                    p.get("voc_spelling"),
+                    p.get("order_index"),
+                    p.get("first_response"),
+                    p.get("is_new"),
+                    p.get("is_finished"),
+                    p.get("present_state"),
+                    p.get("state_hash"),
+                ),
             )
         return len(payloads)
 
     prev_snapshot = conn.execute(
         """
-        SELECT snapshot_time FROM snapshots
+        SELECT snapshot_time
+        FROM snapshots
         WHERE study_day_key=? AND snapshot_time<? AND COALESCE(data_complete,1)=1 AND COALESCE(api_success,1)=1
-        ORDER BY snapshot_time DESC LIMIT 1
+        ORDER BY snapshot_time DESC
+        LIMIT 1
         """,
         (study_day_key, snapshot_time),
     ).fetchone()
@@ -1534,6 +1610,7 @@ def _v3_insert_study_snapshot(conn: sqlite3.Connection, *, study_day_key: str, s
             "is_finished": None if it.get("is_finished") is None else int(bool(it.get("is_finished"))),
             "present_state": it.get("present_state"),
         }
+
     changes = 0
     current_ids = set(payloads)
     for vid, p in payloads.items():
@@ -1568,7 +1645,7 @@ def _v3_insert_study_snapshot(conn: sqlite3.Connection, *, study_day_key: str, s
             )
             changes += 1
 
-    for vid, prev in prev_by_id.items():
+    for vid in prev_by_id:
         if vid in current_ids:
             continue
         _insert_patch_event(
@@ -1587,7 +1664,14 @@ def _v3_insert_study_snapshot(conn: sqlite3.Connection, *, study_day_key: str, s
     return changes
 
 
-def _v3_insert_overview_day(conn: sqlite3.Connection, *, study_day_key: str, snapshot_time: str, records: list[dict[str, Any]], captured_iso: str) -> int:
+def _v3_insert_overview_day(
+    conn: sqlite3.Connection,
+    *,
+    study_day_key: str,
+    snapshot_time: str,
+    records: list[dict[str, Any]],
+    captured_iso: str,
+) -> int:
     payloads: dict[str, dict[str, Any]] = {}
     for record in records:
         p = record_payload(record, study_day_key)
@@ -1603,9 +1687,6 @@ def _v3_insert_overview_day(conn: sqlite3.Connection, *, study_day_key: str, sna
     had_day_baseline = bool(previous)
     changes = 0
 
-    # compact_overview_day_records is the daily materialized baseline.
-    # The first full write for a day is stored only as baseline.  Later writes
-    # store one sparse patch row per changed voc_id.
     if had_day_baseline:
         for vid in sorted(set(previous) - set(payloads)):
             _insert_patch_event(
@@ -1666,8 +1747,27 @@ def _v3_insert_overview_day(conn: sqlite3.Connection, *, study_day_key: str, sna
               tags_text, tag_well, tag_sticking, current_state, is_overdue, state_hash
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            (study_day_key, snapshot_time, p.get("voc_id"), p.get("spelling"), p.get("add_date"), p.get("first_study_date"), p.get("last_study_date"), p.get("next_study_date"), p.get("last_response"), p.get("last_response_cn"), p.get("study_count"), p.get("tags_text"), p.get("tag_well"), p.get("tag_sticking"), p.get("current_state"), p.get("is_overdue"), p.get("state_hash")),
+            (
+                study_day_key,
+                snapshot_time,
+                p.get("voc_id"),
+                p.get("spelling"),
+                p.get("add_date"),
+                p.get("first_study_date"),
+                p.get("last_study_date"),
+                p.get("next_study_date"),
+                p.get("last_response"),
+                p.get("last_response_cn"),
+                p.get("study_count"),
+                p.get("tags_text"),
+                p.get("tag_well"),
+                p.get("tag_sticking"),
+                p.get("current_state"),
+                p.get("is_overdue"),
+                p.get("state_hash"),
+            ),
         )
+
     conn.execute(
         """
         INSERT INTO compact_overview_day_checkpoints(study_day_key, snapshot_time, record_count, created_at)
@@ -1679,6 +1779,7 @@ def _v3_insert_overview_day(conn: sqlite3.Connection, *, study_day_key: str, sna
         """,
         (study_day_key, snapshot_time, len(payloads), captured_iso),
     )
+
     if _compact_table_exists(conn, "overview_snapshot_metrics"):
         counts = {"total": len(payloads), "known": 0, "vague": 0, "forget": 0, "overdue": 0, "well": 0, "sticking": 0}
         for p in payloads.values():
@@ -1702,11 +1803,22 @@ def _v3_insert_overview_day(conn: sqlite3.Connection, *, study_day_key: str, sna
               overdue_count, well_known_count, sticking_count, record_count
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
             """,
-            (snapshot_time, study_day_key, study_day_key[:7], counts["total"], counts["known"], counts["vague"], counts["forget"], counts["overdue"], counts["well"], counts["sticking"], len(payloads)),
+            (
+                snapshot_time,
+                study_day_key,
+                study_day_key[:7],
+                counts["total"],
+                counts["known"],
+                counts["vague"],
+                counts["forget"],
+                counts["overdue"],
+                counts["well"],
+                counts["sticking"],
+                len(payloads),
+            ),
         )
     _RECONSTRUCT_CACHE.clear()
     return changes
-
 
 
 def import_api_snapshot(
@@ -1728,13 +1840,12 @@ def import_api_snapshot(
     snap_time = iso_bj(captured_at, milliseconds=True)
     snap_name = snapshot_name(captured_at)
     created_iso = iso_bj()
+
     all_list = extract_today_items(all_items)
     done_list = extract_today_items(done_items)
     todo_list = extract_today_items(todo_items)
     records = records or []
 
-    # Some API responses contain done/todo lists but no combined all list.  Use
-    # the combined lists as the detail source instead of writing false zeros.
     if not all_list and (done_list or todo_list):
         all_list = list(done_list) + list(todo_list)
 
@@ -1742,11 +1853,38 @@ def import_api_snapshot(
     progress_total = nullable_int(p.get("total")) or 0
     progress_finished = nullable_int(p.get("finished")) or 0
     has_detail_items = _v3_has_detail_today_items(all_list, done_list, todo_list)
-    data_complete = 1
-    incomplete_reason = None
+
+    # Dangerous 04:00/rollover guard: progress can be positive while today_items
+    # is empty. In that case, write only an incomplete marker and do not touch
+    # snapshot_progress, today-item tables, or overview checkpoints.
     if not has_detail_items and (progress_total > 0 or progress_finished > 0):
-        data_complete = 0
-        incomplete_reason = "today_items_empty_but_progress_present"
+        reason = "today_items_empty_but_progress_present"
+        conn.execute(
+            """
+            INSERT INTO snapshots(snapshot_time, study_day_key, source, api_success, data_complete, incomplete_reason, created_at)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(snapshot_time) DO UPDATE SET
+              study_day_key=excluded.study_day_key,
+              source=excluded.source,
+              api_success=excluded.api_success,
+              data_complete=excluded.data_complete,
+              incomplete_reason=excluded.incomplete_reason
+            """,
+            (snap_time, study_day_key, source, 0, 0, reason, created_iso),
+        )
+        conn.execute("INSERT OR REPLACE INTO compact_meta(key,value) VALUES(?,?)", ("schema_version", COMPACT_SCHEMA_VERSION))
+        conn.execute("INSERT OR REPLACE INTO compact_meta(key,value) VALUES(?,?)", ("last_sync_at", created_iso))
+        conn.execute("PRAGMA optimize")
+        _RECONSTRUCT_CACHE.clear()
+        return ImportResult(
+            snapshot_id=0,
+            snapshot_time=snap_time,
+            day_key=study_day_key,
+            snapshot_name=snap_name,
+            inserted_records=0,
+            today_item_changes=0,
+            overview_changes=0,
+        )
 
     conn.execute(
         """
@@ -1759,19 +1897,849 @@ def import_api_snapshot(
           data_complete=excluded.data_complete,
           incomplete_reason=excluded.incomplete_reason
         """,
-        (snap_time, study_day_key, source, 1, data_complete, incomplete_reason, created_iso),
+        (snap_time, study_day_key, source, 1, 1, None, created_iso),
     )
-    _v3_insert_snapshot_progress(conn, snapshot_time=snap_time, study_day_key=study_day_key, progress=progress, all_list=all_list, done_list=done_list, todo_list=todo_list)
 
-    if has_detail_items:
-        today_changes = _v3_insert_study_snapshot(conn, study_day_key=study_day_key, snapshot_time=snap_time, all_list=all_list, captured_iso=created_iso)
-    else:
-        today_changes = 0
+    _v3_insert_snapshot_progress(
+        conn,
+        snapshot_time=snap_time,
+        study_day_key=study_day_key,
+        progress=progress,
+        all_list=all_list,
+        done_list=done_list,
+        todo_list=todo_list,
+    )
 
-    overview_changes = _v3_insert_overview_day(conn, study_day_key=study_day_key, snapshot_time=snap_time, records=records, captured_iso=created_iso) if records else 0
+    today_changes = _v3_insert_study_snapshot(
+        conn,
+        study_day_key=study_day_key,
+        snapshot_time=snap_time,
+        all_list=all_list,
+        captured_iso=created_iso,
+    ) if has_detail_items else 0
+
+    overview_changes = _v3_insert_overview_day(
+        conn,
+        study_day_key=study_day_key,
+        snapshot_time=snap_time,
+        records=records,
+        captured_iso=created_iso,
+    ) if records else 0
+
     conn.execute("INSERT OR REPLACE INTO compact_meta(key,value) VALUES(?,?)", ("schema_version", COMPACT_SCHEMA_VERSION))
     conn.execute("INSERT OR REPLACE INTO compact_meta(key,value) VALUES(?,?)", ("last_sync_at", created_iso))
     conn.execute("PRAGMA optimize")
-    return ImportResult(snapshot_id=0, snapshot_time=snap_time, day_key=study_day_key, snapshot_name=snap_name, inserted_records=len(records), today_item_changes=today_changes, overview_changes=overview_changes)
+    _RECONSTRUCT_CACHE.clear()
+
+    return ImportResult(
+        snapshot_id=0,
+        snapshot_time=snap_time,
+        day_key=study_day_key,
+        snapshot_name=snap_name,
+        inserted_records=len(records),
+        today_item_changes=today_changes,
+        overview_changes=overview_changes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Light dashboard route
+# ---------------------------------------------------------------------------
+
+
+def _light_overview_records_for_day(conn: sqlite3.Connection, day: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM compact_overview_day_records
+        WHERE study_day_key=?
+        ORDER BY next_study_date, add_date, spelling COLLATE NOCASE
+        """,
+        (day,),
+    ).fetchall()
+    return [_v3_overview_payload(row) for row in rows]
+
+
+def _light_latest_progress_row_for_day(conn: sqlite3.Connection, day: str, snapshot_time: str | None) -> sqlite3.Row | None:
+    if snapshot_time:
+        row = conn.execute(
+            """
+            SELECT p.*
+            FROM snapshot_progress p
+            JOIN snapshots s ON s.snapshot_time=p.snapshot_time
+            WHERE p.study_day_key=?
+              AND p.snapshot_time=?
+              AND COALESCE(s.data_complete, 1)=1
+              AND COALESCE(s.api_success, 1)=1
+            LIMIT 1
+            """,
+            (day, snapshot_time),
+        ).fetchone()
+        if row and not _v3_progress_detail_missing(row):
+            return row
+
+    rows = conn.execute(
+        """
+        SELECT p.*
+        FROM snapshot_progress p
+        JOIN snapshots s ON s.snapshot_time=p.snapshot_time
+        WHERE p.study_day_key=?
+          AND COALESCE(s.data_complete, 1)=1
+          AND COALESCE(s.api_success, 1)=1
+        ORDER BY p.snapshot_time DESC
+        LIMIT 20
+        """,
+        (day,),
+    ).fetchall()
+    for row in rows:
+        if not _v3_progress_detail_missing(row):
+            return row
+    return None
+
+
+def _light_int(value: Any, fallback: int = 0) -> int:
+    try:
+        if value is None:
+            return fallback
+        return int(value)
+    except Exception:
+        return fallback
+
+
+def _light_float_or_none(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        x = float(value)
+        return x if x == x else None
+    except Exception:
+        return None
+
+
+def _light_memory_int_floor(value: float) -> int:
+    return int(value // 1)
+
+
+def _light_memory_int_ceil(value: float) -> int:
+    i = int(value // 1)
+    return i if value == i else i + 1
+
+
+def _light_memory_integer_bounds(spec: dict[str, Any]) -> tuple[int | None, int | None]:
+    lower = spec.get("lower", float("-inf"))
+    upper = spec.get("upper", float("inf"))
+
+    if lower == float("-inf"):
+        lo = None
+    elif spec.get("lowerInclusive", True):
+        lo = _light_memory_int_ceil(float(lower))
+    else:
+        lo = _light_memory_int_floor(float(lower)) + 1
+
+    if upper == float("inf"):
+        hi = None
+    elif spec.get("upperInclusive", True):
+        hi = _light_memory_int_floor(float(upper))
+    else:
+        hi = _light_memory_int_ceil(float(upper)) - 1
+
+    return lo, hi
+
+
+def _light_memory_prefix(bucket: list[int | float]) -> list[int | float]:
+    prefix: list[int | float] = [0] * (len(bucket) + 1)
+    running: int | float = 0
+    for i, value in enumerate(bucket):
+        running += value
+        prefix[i + 1] = running
+    return prefix
+
+
+def _light_memory_prefix_range(prefix: list[int | float], offset: int, lo: int | None, hi: int | None) -> int | float:
+    if not prefix:
+        return 0
+
+    n = len(prefix) - 1
+    first_value = -offset
+    last_value = n - offset - 1
+
+    left_value = first_value if lo is None else max(lo, first_value)
+    right_value = last_value if hi is None else min(hi, last_value)
+    if right_value < left_value:
+        return 0
+
+    left_idx = left_value + offset
+    right_idx_exclusive = right_value + offset + 1
+    return prefix[right_idx_exclusive] - prefix[left_idx]
+
+
+def _light_empty_memory_stats(specs: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "counts": {str(spec["id"]): 0 for spec in specs},
+        "avgs": {str(spec["id"]): None for spec in specs},
+    }
+
+
+def _light_sql_placeholders(items: list[Any]) -> str:
+    return ",".join("?" for _ in items)
+
+
+def _light_page_memory_stats(
+    conn: sqlite3.Connection,
+    days: list[str],
+    specs: list[dict[str, Any]],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    if not days:
+        return {}
+
+    empty = {
+        day: {
+            "memoryReviewSpanStats": _light_empty_memory_stats(specs),
+            "memoryCriticalStats": _light_empty_memory_stats(specs),
+            "memoryOverdueStats": _light_empty_memory_stats(specs),
+            "criticalStatus": {"dueToday": 0, "dueByOffset": {}},
+            "dailyAllReviewAvgStudyCount": None,
+        }
+        for day in days
+    }
+    if not specs:
+        return empty
+
+    ph = _light_sql_placeholders(days)
+    rows = conn.execute(
+        f"""
+        SELECT
+          study_day_key,
+          study_count,
+          CAST(
+            julianday(date(next_study_date, '+8 hours'))
+            - julianday(date(last_study_date, '+8 hours'))
+            AS INTEGER
+          ) AS review_span_days,
+          CAST(
+            julianday(date(next_study_date, '+8 hours'))
+            - julianday(study_day_key)
+            AS INTEGER
+          ) AS critical_days
+        FROM compact_overview_day_records
+        WHERE study_day_key IN ({ph})
+        ORDER BY study_day_key
+        """,
+        list(days),
+    ).fetchall()
+    if not rows:
+        return empty
+
+    min_daycount = 0
+    max_daycount = 0
+    values_seen = False
+    for row in rows:
+        review_days = row["review_span_days"]
+        critical_days = row["critical_days"]
+
+        if review_days is not None and int(review_days) >= 1:
+            v = int(review_days)
+            min_daycount = min(min_daycount, v)
+            max_daycount = max(max_daycount, v)
+            values_seen = True
+
+        if critical_days is not None:
+            c = int(critical_days)
+            if c >= 0:
+                min_daycount = min(min_daycount, c)
+                max_daycount = max(max_daycount, c)
+                values_seen = True
+            else:
+                min_daycount = min(min_daycount, c, -c)
+                max_daycount = max(max_daycount, c, -c)
+                values_seen = True
+
+    if not values_seen:
+        return empty
+
+    offset = -min_daycount
+    size = max_daycount - min_daycount + 1
+    day_index = {day: i for i, day in enumerate(days)}
+
+    metrics = ("review", "critical", "overdue_age", "overdue_raw")
+    count_buckets = {metric: [[0] * size for _ in days] for metric in metrics}
+    sum_buckets = {metric: [[0.0] * size for _ in days] for metric in metrics}
+    avg_count_buckets = {metric: [[0] * size for _ in days] for metric in metrics}
+    critical_due_by_offset: list[dict[str, int]] = [{} for _ in days]
+    review_study_count_sums = [0.0 for _ in days]
+    review_study_count_ns = [0 for _ in days]
+
+    def add(metric: str, day_i: int, value: int, study_count: float | None) -> None:
+        idx = value + offset
+        if idx < 0 or idx >= size:
+            return
+        count_buckets[metric][day_i][idx] += 1
+        if study_count is not None:
+            sum_buckets[metric][day_i][idx] += study_count
+            avg_count_buckets[metric][day_i][idx] += 1
+
+    for row in rows:
+        day = str(row["study_day_key"])
+        day_i = day_index.get(day)
+        if day_i is None:
+            continue
+
+        study_count = _light_float_or_none(row["study_count"])
+        review_days = row["review_span_days"]
+        critical_days = row["critical_days"]
+
+        if review_days is not None:
+            r = int(review_days)
+            if r >= 1:
+                add("review", day_i, r, study_count)
+
+        if critical_days is not None:
+            c = int(critical_days)
+            due_key = str(c)
+            critical_due_by_offset[day_i][due_key] = critical_due_by_offset[day_i].get(due_key, 0) + 1
+            if c <= 0 and study_count is not None:
+                review_study_count_sums[day_i] += study_count
+                review_study_count_ns[day_i] += 1
+
+            if c >= 0:
+                add("critical", day_i, c, study_count)
+            else:
+                add("overdue_raw", day_i, c, study_count)
+                add("overdue_age", day_i, max(1, -c), study_count)
+
+    out: dict[str, dict[str, dict[str, Any]]] = {}
+    for day_i, day in enumerate(days):
+        out[day] = {
+            "memoryReviewSpanStats": _light_empty_memory_stats(specs),
+            "memoryCriticalStats": _light_empty_memory_stats(specs),
+            "memoryOverdueStats": _light_empty_memory_stats(specs),
+            "criticalStatus": {
+                "dueToday": sum(v for k, v in critical_due_by_offset[day_i].items() if int(k) <= 0),
+                "dueByOffset": critical_due_by_offset[day_i],
+            },
+            "dailyAllReviewAvgStudyCount": (
+                review_study_count_sums[day_i] / review_study_count_ns[day_i]
+                if review_study_count_ns[day_i]
+                else None
+            ),
+        }
+
+        prefixes: dict[str, tuple[list[int | float], list[int | float], list[int | float]]] = {}
+        for metric in metrics:
+            prefixes[metric] = (
+                _light_memory_prefix(count_buckets[metric][day_i]),
+                _light_memory_prefix(sum_buckets[metric][day_i]),
+                _light_memory_prefix(avg_count_buckets[metric][day_i]),
+            )
+
+        for spec in specs:
+            spec_id = str(spec["id"])
+            lo, hi = _light_memory_integer_bounds(spec)
+            specs_to_metrics = [
+                ("memoryReviewSpanStats", "review"),
+                ("memoryCriticalStats", "critical"),
+            ]
+            upper = spec.get("upper", float("inf"))
+            overdue_metric = "overdue_raw" if upper != float("inf") and upper <= 0 else "overdue_age"
+            specs_to_metrics.append(("memoryOverdueStats", overdue_metric))
+
+            for stat_key, metric in specs_to_metrics:
+                count_prefix, sum_prefix, avg_count_prefix = prefixes[metric]
+                count = int(_light_memory_prefix_range(count_prefix, offset, lo, hi))
+                total = float(_light_memory_prefix_range(sum_prefix, offset, lo, hi))
+                avg_n = int(_light_memory_prefix_range(avg_count_prefix, offset, lo, hi))
+                out[day][stat_key]["counts"][spec_id] = count
+                out[day][stat_key]["avgs"][spec_id] = (total / avg_n) if avg_n else None
+
+    return out
+
+
+def _light_progress_numbers(
+    row: sqlite3.Row | dict[str, Any] | None,
+    records: list[dict[str, Any]] | None = None,
+    day: str | None = None,
+    critical_due_today: int | None = None,
+) -> dict[str, Any]:
+    raw_finished = _light_int(row_value(row, "finished"))
+    raw_total = _light_int(row_value(row, "total"))
+    study_time_ms = _light_int(row_value(row, "study_time"))
+
+    first_forget_done = _light_int(row_value(row, "first_forget_done"))
+    first_forget_all = _light_int(row_value(row, "first_forget_all"))
+    vague_done = _light_int(row_value(row, "vague_done"))
+    vague_all = _light_int(row_value(row, "vague_all"))
+    familiar_done = _light_int(row_value(row, "familiar_done"))
+    familiar_all = _light_int(row_value(row, "familiar_all"))
+
+    new_total_raw = _light_int(row_value(row, "new_words"))
+    pending_new_raw = _light_int(row_value(row, "pending_new_words"))
+    all_items_count = _light_int(row_value(row, "all_items_count"))
+    done_items_count = _light_int(row_value(row, "done_items_count"))
+    todo_items_count = _light_int(row_value(row, "todo_items_count"))
+
+    has_precomputed_critical_due_today = critical_due_today is not None
+    if critical_due_today is None:
+        critical_due_today = 0
+    if not has_precomputed_critical_due_today and records is not None and day:
+        try:
+            critical_due_today = int((_study_status_critical_from_records(records, day) or {}).get("dueToday") or 0)
+        except Exception:
+            critical_due_today = 0
+
+    # Canonical dashboard rule:
+    # 今日总数 = 记忆临界点 + 今日新学总数
+    # The raw Maimemo progress.total is retained only as diagnostic data.
+    new_total = max(0, new_total_raw)
+    new_pending = min(max(0, pending_new_raw), new_total)
+    new_done = max(0, new_total - new_pending)
+    review_total = max(0, critical_due_today)
+
+    response_done_total = first_forget_done + vague_done + familiar_done
+    finished_source = max(
+        0,
+        done_items_count,
+        response_done_total,
+        raw_finished if raw_finished <= review_total + new_total else 0,
+    )
+
+    review_done = max(0, finished_source - new_done)
+    review_done = min(review_done, review_total)
+    finished = new_done + review_done
+    total = review_total + new_total
+    unfinished = max(0, total - finished)
+
+    has_item_detail = any(x > 0 for x in (
+        all_items_count,
+        done_items_count,
+        todo_items_count,
+        new_total_raw,
+        pending_new_raw,
+        first_forget_done,
+        first_forget_all,
+        vague_done,
+        vague_all,
+        familiar_done,
+        familiar_all,
+    ))
+
+    return {
+        "snapshot": row_value(row, "snapshot_time") or "",
+        "rawProgressFinished": raw_finished,
+        "rawProgressTotal": raw_total,
+        "studyTimeMs": study_time_ms,
+        "known": familiar_done,
+        "vague": vague_done,
+        "forget": first_forget_done,
+        "allKnown": familiar_all,
+        "allVague": vague_all,
+        "allForget": first_forget_all,
+        "newDone": new_done,
+        "newPending": new_pending,
+        "newTotal": new_total,
+        "reviewDone": review_done,
+        "reviewPending": max(0, review_total - review_done),
+        "reviewTotal": review_total,
+        "finished": finished,
+        "total": total,
+        "unfinished": unfinished,
+        "criticalDueToday": critical_due_today,
+        "allItemsCount": all_items_count,
+        "doneItemsCount": done_items_count,
+        "todoItemsCount": todo_items_count,
+        "hasItemDetail": has_item_detail,
+    }
+
+
+def _light_summary_from_records_and_progress(
+    records: list[dict[str, Any]],
+    progress_row: sqlite3.Row | dict[str, Any] | None,
+    day: str,
+    memory_thresholds_text: str | None = None,
+    memory_stats: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    specs = parse_memory_threshold_specs_from_text(memory_thresholds_text) or parse_memory_threshold_specs_from_text(FALLBACK_MEMORY_THRESHOLDS)
+    review_span_stats = _new_memory_stats(specs) if memory_stats is None else None
+    critical_stats = _new_memory_stats(specs) if memory_stats is None else None
+    overdue_stats = _new_memory_stats(specs) if memory_stats is None else None
+    critical_status = memory_stats.get("criticalStatus") if isinstance(memory_stats, dict) else None
+    progress_numbers = _light_progress_numbers(
+        progress_row,
+        records=records,
+        day=day,
+        critical_due_today=int((critical_status or {}).get("dueToday") or 0) if critical_status is not None else None,
+    )
+
+    total_study_count = 0.0
+    total_study_count_n = 0
+    review_study_counts: list[float] = []
+
+    out: dict[str, Any] = {
+        "totalWords": len(records),
+        "熟知": 0,
+        "顽固": 0,
+        "认识": 0,
+        "模糊": 0,
+        "忘记": 0,
+        "逾期": 0,
+        "avgStudyCount": 0,
+        "dailyNewLearnedCount": progress_numbers["newDone"],
+        "dailyPendingNewCount": progress_numbers["newPending"],
+        "dailyReviewedCount": progress_numbers["reviewDone"],
+        "dailyAllReviewAvgStudyCount": None,
+        "newLearnedResponseCounts": response_counts_empty(),
+        "newLearnedResponseSampleCount": 0,
+        "newLearnedResponseExcludedDate": "2026-05-11",
+        "memoryReferenceNowUtc": day,
+    }
+
+    for record in records:
+        tag_text = str(record.get("tags_text") or "")
+        tags = [x.strip() for x in tag_text.replace("；", ";").replace("，", ",").replace(",", ";").split(";") if x.strip()]
+        if record.get("tag_well") == "是" or "熟知" in tags:
+            out["熟知"] += 1
+        if record.get("tag_sticking") == "是" or "顽固" in tags:
+            out["顽固"] += 1
+
+        state = str(record.get("current_state") or "").strip()
+        if not state and record.get("is_overdue") == "是":
+            state = "逾期"
+        if state in ("认识", "模糊", "忘记", "逾期"):
+            out[state] += 1
+
+        study_count = _light_float_or_none(record.get("study_count"))
+        if study_count is not None:
+            total_study_count += study_count
+            total_study_count_n += 1
+
+        if review_span_stats is not None:
+            span_days = _date_diff_days(record.get("next_study_date"), record.get("last_study_date"))
+            if span_days is not None:
+                _add_memory_stat(review_span_stats, specs, span_days, study_count, "review_span")
+
+        if critical_stats is not None or overdue_stats is not None or memory_stats is None:
+            critical_days = _date_diff_days(record.get("next_study_date"), f"{day}T12:00:00+08:00")
+        else:
+            critical_days = None
+
+        if critical_days is not None:
+            if critical_stats is not None:
+                _add_memory_stat(critical_stats, specs, critical_days, study_count, "critical_point")
+            if overdue_stats is not None:
+                _add_memory_stat(overdue_stats, specs, critical_days, study_count, "overdue")
+            if critical_days <= 0 and study_count is not None:
+                review_study_counts.append(study_count)
+
+    out["avgStudyCount"] = (total_study_count / total_study_count_n) if total_study_count_n else 0
+    if memory_stats is not None:
+        out["dailyAllReviewAvgStudyCount"] = memory_stats.get("dailyAllReviewAvgStudyCount")
+        out["memoryReviewSpanStats"] = memory_stats.get("memoryReviewSpanStats") or _light_empty_memory_stats(specs)
+        out["memoryCriticalStats"] = memory_stats.get("memoryCriticalStats") or _light_empty_memory_stats(specs)
+        out["memoryOverdueStats"] = memory_stats.get("memoryOverdueStats") or _light_empty_memory_stats(specs)
+    else:
+        out["dailyAllReviewAvgStudyCount"] = (sum(review_study_counts) / len(review_study_counts)) if review_study_counts else None
+        out["memoryReviewSpanStats"] = _finalize_memory_stats(review_span_stats or _new_memory_stats(specs))
+        out["memoryCriticalStats"] = _finalize_memory_stats(critical_stats or _new_memory_stats(specs))
+        out["memoryOverdueStats"] = _finalize_memory_stats(overdue_stats or _new_memory_stats(specs))
+    return out
+
+
+def _light_progress_payload(
+    row: sqlite3.Row | dict[str, Any] | None,
+    records: list[dict[str, Any]] | None = None,
+    day: str | None = None,
+    critical_due_today: int | None = None,
+) -> dict[str, Any] | None:
+    if not row:
+        return None
+    n = _light_progress_numbers(row, records=records, day=day, critical_due_today=critical_due_today)
+    snapshot = n["snapshot"]
+    return {
+        "snapshot": snapshot,
+        "capturedAt": snapshot,
+        "progress": {
+            "finished": n["finished"],
+            "total": n["total"],
+            "study_time": n["studyTimeMs"],
+        },
+        "finished": n["finished"],
+        "total": n["total"],
+        "studyTimeMs": n["studyTimeMs"],
+        "todayFirstForgetCount": n["forget"],
+        "todayKnownCount": n["known"],
+        "todayVagueCount": n["vague"],
+        "todayAllFirstForgetCount": n["allForget"],
+        "todayAllKnownCount": n["allKnown"],
+        "todayAllVagueCount": n["allVague"],
+        "dailyNewLearnedCount": n["newDone"],
+        "dailyPendingNewCount": n["newPending"],
+        "dailyAllNewCount": n["newTotal"],
+        "dailyReviewedCount": n["reviewDone"],
+        "dailyPendingReviewCount": n["reviewPending"],
+        "dailyAllReviewCount": n["reviewTotal"],
+        "unfinishedCount": n["unfinished"],
+        "criticalDueToday": n["criticalDueToday"],
+        "rawProgressFinished": n["rawProgressFinished"],
+        "rawProgressTotal": n["rawProgressTotal"],
+        "hasItemDetail": n["hasItemDetail"],
+    }
+
+
+def _light_study_status(
+    day: str,
+    records: list[dict[str, Any]],
+    progress_row: sqlite3.Row | dict[str, Any] | None,
+    snapshot_time: str | None,
+    overall_status: dict[str, Any] | None = None,
+    critical_status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    n = _light_progress_numbers(
+        progress_row,
+        records=records,
+        day=day,
+        critical_due_today=int((critical_status or {}).get("dueToday") or 0) if critical_status is not None else None,
+    )
+    snapshot = snapshot_time or n["snapshot"] or ""
+    today = {
+        "known": n["known"],
+        "vague": n["vague"],
+        "forget": n["forget"],
+        "allKnown": n["allKnown"],
+        "allVague": n["allVague"],
+        "allForget": n["allForget"],
+        "finished": n["finished"],
+        "total": n["total"],
+        "unfinished": n["unfinished"],
+        "newDone": n["newDone"],
+        "newPending": n["newPending"],
+        "newTotal": n["newTotal"],
+        "reviewDone": n["reviewDone"],
+        "reviewPending": n["reviewPending"],
+        "reviewTotal": n["reviewTotal"],
+        "criticalDueToday": n["criticalDueToday"],
+        "studyTimeMs": n["studyTimeMs"],
+        "studyTimeSeconds": n["studyTimeMs"] / 1000,
+    }
+
+    response_done_total = n["known"] + n["vague"] + n["forget"]
+    task_done_total = n["reviewDone"] + n["newDone"]
+    task_total = n["reviewTotal"] + n["newTotal"]
+
+    return {
+        "version": 3,
+        "date": day,
+        "snapshot": snapshot,
+        "capturedAt": snapshot,
+        "today": today,
+        "overall": overall_status or _study_status_overall_from_records(records, day),
+        "critical": critical_status or _study_status_critical_from_records(records, day),
+        "checks": {
+            "responseDoneEqualsTaskDone": response_done_total == task_done_total,
+            "taskDoneEqualsFinished": task_done_total == n["finished"],
+            "taskTotalEqualsDbTotal": task_total == n["total"],
+            "unfinishedEqualsTotalMinusFinished": n["unfinished"] == max(n["total"] - n["finished"], 0),
+            "responseDoneTotal": response_done_total,
+            "taskDoneTotal": task_done_total,
+            "dbFinished": n["finished"],
+            "taskTotal": task_total,
+            "dbTotal": n["total"],
+            "unfinishedTotal": n["unfinished"],
+            "rawProgressFinished": n["rawProgressFinished"],
+            "rawProgressTotal": n["rawProgressTotal"],
+            "hasItemDetail": n["hasItemDetail"],
+        },
+        "dbSnapshot": {
+            "finished": n["finished"],
+            "total": n["total"],
+            "studyTimeMs": n["studyTimeMs"],
+            "rawProgressFinished": n["rawProgressFinished"],
+            "rawProgressTotal": n["rawProgressTotal"],
+            "firstForgetDone": _light_int(row_value(progress_row, "first_forget_done")),
+            "firstForgetAll": _light_int(row_value(progress_row, "first_forget_all")),
+            "vagueDone": _light_int(row_value(progress_row, "vague_done")),
+            "vagueAll": _light_int(row_value(progress_row, "vague_all")),
+            "familiarDone": _light_int(row_value(progress_row, "familiar_done")),
+            "familiarAll": _light_int(row_value(progress_row, "familiar_all")),
+            "newWords": _light_int(row_value(progress_row, "new_words")),
+            "reviewWords": n["reviewTotal"],
+            "pendingNewWords": _light_int(row_value(progress_row, "pending_new_words")),
+            "allItemsCount": _light_int(row_value(progress_row, "all_items_count")),
+            "doneItemsCount": _light_int(row_value(progress_row, "done_items_count")),
+            "todoItemsCount": _light_int(row_value(progress_row, "todo_items_count")),
+        },
+    }
+
+
+def get_dashboard_data_page_light(
+    conn: sqlite3.Connection,
+    offset: int = 0,
+    limit: int = 30,
+    order: str = "asc",
+    memory_thresholds_text: str | None = None,
+) -> dict[str, Any]:
+    """Return dashboard page using daily latest materialized state only.
+
+    This light route avoids build_dashboard_day_payload() and
+    reconstruct_study_day_items_at(). Dashboard total uses the canonical rule:
+    今日总数 = 记忆临界点 + 今日新学总数。
+    """
+    total_start = time.perf_counter()
+    timings: dict[str, float] = {}
+
+    t0 = time.perf_counter()
+    days = list_days(conn)
+    timings["list_days_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+    if str(order or "asc").lower() == "desc":
+        days = list(reversed(days))
+
+    total = len(days)
+    safe_offset = max(0, int(offset or 0))
+    safe_limit = max(1, min(200, int(limit or 30)))
+    page_days = days[safe_offset:safe_offset + safe_limit]
+
+    day_payloads: list[dict[str, Any]] = []
+    day_timings: list[dict[str, Any]] = []
+
+    t0 = time.perf_counter()
+    memory_specs = parse_memory_threshold_specs_from_text(memory_thresholds_text) or parse_memory_threshold_specs_from_text(FALLBACK_MEMORY_THRESHOLDS)
+    page_memory_stats = _light_page_memory_stats(conn, page_days, memory_specs)
+    timings["memory_stats_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+    build_start = time.perf_counter()
+    for index, day in enumerate(page_days, start=1):
+        day_start = time.perf_counter()
+
+        snap = latest_snapshot_time_for_day(conn, day)
+        records = _light_overview_records_for_day(conn, day) if snap else []
+        progress_row = _light_latest_progress_row_for_day(conn, day, snap)
+        memory_stats = page_memory_stats.get(day)
+
+        summary = _light_summary_from_records_and_progress(
+            records,
+            progress_row,
+            day,
+            memory_thresholds_text,
+            memory_stats=memory_stats,
+        )
+        critical_status = (memory_stats or {}).get("criticalStatus") if isinstance(memory_stats, dict) else None
+        overall_status = {
+            "totalWords": summary.get("totalWords", len(records)),
+            "wellKnown": summary.get("熟知", 0),
+            "sticking": summary.get("顽固", 0),
+            "knownState": summary.get("认识", 0),
+            "vagueState": summary.get("模糊", 0),
+            "forgetState": summary.get("忘记", 0),
+            "overdue": summary.get("逾期", 0),
+            "avgStudyCount": summary.get("avgStudyCount", 0),
+        }
+        progress = _light_progress_payload(
+            progress_row,
+            records=records,
+            day=day,
+            critical_due_today=int((critical_status or {}).get("dueToday") or 0) if critical_status is not None else None,
+        )
+        study_status = _light_study_status(
+            day,
+            records,
+            progress_row,
+            snap,
+            overall_status=overall_status,
+            critical_status=critical_status,
+        )
+
+        overview_update_time = ""
+        if progress and progress.get("capturedAt"):
+            overview_update_time = str(progress["capturedAt"]).replace("T", " ").split("+")[0][-12:]
+
+        elapsed_ms = round((time.perf_counter() - day_start) * 1000, 2)
+        today_item_count = _light_int(row_value(progress_row, "all_items_count"))
+
+        day_timings.append({
+            "date": day,
+            "index": safe_offset + index,
+            "elapsed_ms": elapsed_ms,
+            "row_count": len(records),
+            "today_item_count": today_item_count,
+        })
+        day_payloads.append({
+            "date": day,
+            "summary": summary,
+            "overviewUpdateTime": overview_update_time,
+            "latestProgress": progress,
+            "studyStatus": study_status,
+            "rowCount": len(records),
+            "todayItemCount": today_item_count,
+        })
+
+    timings["build_days_ms"] = round((time.perf_counter() - build_start) * 1000, 2)
+    timings["total_db_ms"] = round((time.perf_counter() - total_start) * 1000, 2)
+
+    return {
+        "success": True,
+        "source": "sqlite-v28-light-critical-plus-new",
+        "schemaVersion": SCHEMA_VERSION,
+        "studyDayBoundaryHour": STUDY_DAY_BOUNDARY_HOUR,
+        "offset": safe_offset,
+        "limit": safe_limit,
+        "order": "desc" if str(order or "asc").lower() == "desc" else "asc",
+        "total": total,
+        "loaded": len(page_days),
+        "nextOffset": safe_offset + len(page_days),
+        "hasMore": safe_offset + len(page_days) < total,
+        "days": day_payloads,
+        "dayTimings": day_timings,
+        "timings": timings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Export helpers
+# ---------------------------------------------------------------------------
+
+
+def get_latest_snapshot_rows_as_overview_csv_dicts(
+    conn: sqlite3.Connection,
+    day_key: str,
+    trace: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    t = _trace_step_start()
+    snapshot_time_value = latest_snapshot_time_for_day(conn, day_key)
+    _trace_step_done(trace, "overview_day_snapshot_lookup", t, snapshot=snapshot_time_value)
+    if not snapshot_time_value:
+        return []
+
+    t = _trace_step_start()
+    records = reconstruct_overview_records_at(conn, day_key, snapshot_time_value, trace=trace)
+    _trace_step_done(trace, "overview_reconstruct_total", t, rows=len(records))
+
+    today_trace: list[dict[str, Any]] = []
+    t = _trace_step_start()
+    today_items = reconstruct_study_day_items_at(conn, day_key, snapshot_time_value, trace=today_trace)
+    _trace_step_done(trace, "overview_today_items_total", t, rows=len(today_items))
+    if trace is not None:
+        trace.extend(today_trace)
+
+    t = _trace_step_start()
+    today_by_id: dict[str, dict[str, Any]] = {}
+    today_by_spell: dict[str, dict[str, Any]] = {}
+    for item in today_items:
+        if item.get("voc_id"):
+            today_by_id[str(item["voc_id"])] = item
+        if item.get("voc_spelling"):
+            today_by_spell[str(item["voc_spelling"])] = item
+    _trace_step_done(trace, "overview_today_index_build", t, by_id=len(today_by_id), by_spell=len(today_by_spell))
+
+    t = _trace_step_start()
+    out = []
+    for p in records:
+        today = None
+        if p.get("voc_id"):
+            today = today_by_id.get(str(p["voc_id"]))
+        if today is None and p.get("spelling"):
+            today = today_by_spell.get(str(p["spelling"]))
+        out.append(overview_payload_to_csv_row(p, today))
+    _trace_step_done(trace, "overview_csv_rows_build", t, rows=len(out))
+    return out
+
 
 __all__ = [name for name in globals() if not name.startswith('__')]

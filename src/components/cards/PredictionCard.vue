@@ -151,16 +151,15 @@ import { computed, inject, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useSettingsStore } from '@/stores/settingsStore'
 import { usePredictionStore } from '@/stores/predictionStore'
-import { useDataStore } from '@/stores/dataStore'
 import { buildBarOption, COLORS } from '@/utils/chartOptions'
-import { buildDashboardPrediction } from '@/utils/dashboardPrediction'
 import BaseChart from '@/components/charts/BaseChart.vue'
+import { useApi } from '@/composables/useApi'
 
 defineProps({ card: Object })
 
 const settings = useSettingsStore()
 const prediction = usePredictionStore()
-const dataStore = useDataStore()
+const api = useApi()
 const log = inject('log', console.log)
 const isRunning = ref(false)
 const progress = ref({ current: 0, total: 0 })
@@ -202,7 +201,7 @@ const predChartOption = computed(() => {
 })
 
 onMounted(() => {
-  if (!prediction.result?.rows?.length && dataStore.rawRows.length) runPrediction()
+  if (!prediction.result?.rows?.length) runPrediction()
 })
 
 function predictionOptions() {
@@ -235,26 +234,27 @@ function predictionOptions() {
 }
 
 async function runPrediction() {
-  const rows = dataStore.rawRows?.length ? dataStore.rawRows : dataStore.displayRows
-  if (!rows?.length) {
-    ElMessage.warning('没有加载数据，请先连接数据库')
-    return
-  }
   isRunning.value = true
   progress.value = { current: 0, total: Number(settings.predictionDays) || 30 }
   settings.save()
   try {
-    prediction.result = await buildDashboardPrediction(rows, predictionOptions(), (current, total) => {
-      progress.value = { current, total }
-    })
+    const data = await api.fetchFsrsPrediction(predictionOptions())
+    if (!data?.success) throw new Error(data?.error || data?.result?.message || '后端 FSRS 预测失败')
+    prediction.result = data.result
     prediction.saveCache()
     traceResult.value = null
-    ElMessage.success('预测计算完成')
-    log?.('预测计算完成')
+    if (prediction.result?.message && !prediction.result?.rows?.length) {
+      ElMessage.warning(prediction.result.message)
+      log?.(`预测计算完成但无结果：${prediction.result.message}`)
+    } else {
+      ElMessage.success('预测计算完成')
+      log?.('预测计算完成')
+    }
   } catch (error) {
     ElMessage.error(error.message || String(error))
     log?.(`预测计算失败：${error.message || error}`)
   } finally {
+    progress.value = { current: Number(settings.predictionDays) || 30, total: Number(settings.predictionDays) || 30 }
     isRunning.value = false
   }
 }

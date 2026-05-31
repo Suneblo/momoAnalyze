@@ -172,8 +172,7 @@ export function computeMemoryThresholdStats(items, thresholds, mode) {
 export function getMemoryStatsForRow(row, thresholds, mode) {
   const statKey = mode === MEMORY_MODE_CRITICAL_POINT ? 'memoryCriticalStats' : 'memoryReviewSpanStats'
   if (row?.[statKey]?.counts) return row[statKey]
-  const items = mode === MEMORY_MODE_CRITICAL_POINT ? (row?.memoryNextDueItems || []) : (row?.memoryReviewSpanItems || row?.memoryDiffItems || [])
-  return computeMemoryThresholdStats(items, thresholds, mode)
+  return { counts: {}, avgs: {} }
 }
 
 export function formatMemoryThresholdCell(row, spec, mode, thresholds = null) {

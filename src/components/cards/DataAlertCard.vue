@@ -30,11 +30,13 @@
 <script setup>
 import { computed, inject, ref } from 'vue'
 import { useDataStore } from '@/stores/dataStore'
+import { useSettingsStore } from '@/stores/settingsStore'
 import { useApi } from '@/composables/useApi'
 
 defineProps({ card: Object })
 
 const dataStore = useDataStore()
+const settings = useSettingsStore()
 const api = useApi()
 const log = inject('log', null)
 const loading = ref(false)
@@ -100,8 +102,10 @@ async function syncAgain() {
   try {
     const result = await api.syncFromApi()
     if (result?.success === false) throw new Error(result.error || '联网同步失败')
-    const data = await api.fetchDashboardPage(0, 200, true)
+    const data = await api.fetchDashboardPage(0, 60, 'asc', { memoryThresholds: settings.memoryThresholds })
     if (data?.days) dataStore.setDashboardData(data)
+    const alertData = await api.fetchAlerts()
+    if (alertData?.success) dataStore.setAlerts(alertData.alerts || [])
     status.value = '重新获取完成，已刷新页面数据。'
     log?.('数据减少提醒：重新获取完成。')
   } catch (error) {

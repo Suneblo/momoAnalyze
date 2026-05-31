@@ -36,8 +36,142 @@ RESPONSE_CN = {
     "": "",
 }
 
+FALLBACK_MEMORY_THRESHOLDS = "1,2,3,4,5,6,7,15,30"
+
+
+def _format_threshold_number(value: float) -> str:
+    if value == float("inf") or value == float("-inf"):
+        return ""
+    return str(int(value)) if float(value).is_integer() else str(value).rstrip("0").rstrip(".")
+
+
+def _make_threshold_spec(spec_id: str, lower: float, lower_inclusive: bool, upper: float, upper_inclusive: bool) -> dict[str, Any]:
+    return {
+        "id": spec_id,
+        "lower": lower,
+        "lowerInclusive": lower_inclusive,
+        "upper": upper,
+        "upperInclusive": upper_inclusive,
+    }
+
+
+def parse_memory_threshold_specs_from_text(text: str | None) -> list[dict[str, Any]]:
+    raw_parts = [
+        part.strip()
+        for part in str(text or "").replace("，", ",").replace("；", ",").replace(";", ",").split(",")
+        if part.strip()
+    ]
+    specs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    import re
+
+    for raw in raw_parts:
+        normalized = raw.replace("～", "-").replace("—", "-").replace("–", "-")
+        normalized = "".join(normalized.split())
+        spec: dict[str, Any] | None = None
+
+        cmp = re.match(r"^(<=|>=|<|>)(-?\d+(?:\.\d+)?)$", normalized)
+        if cmp:
+            op = cmp.group(1)
+            value = float(cmp.group(2))
+            label_value = _format_threshold_number(value)
+            if op == ">":
+                spec = _make_threshold_spec(f"gt:{label_value}", value, False, float("inf"), True)
+            elif op == ">=":
+                spec = _make_threshold_spec(f"gte:{label_value}", value, True, float("inf"), True)
+            elif op == "<":
+                spec = _make_threshold_spec(f"lt:{label_value}", float("-inf"), True, value, False)
+            elif op == "<=":
+                spec = _make_threshold_spec(f"lte:{label_value}", float("-inf"), True, value, True)
+
+        if spec is None:
+            rng = re.match(r"^(-?\d+(?:\.\d+)?)\s*-\s*(-?\d+(?:\.\d+)?)$", normalized)
+            if rng:
+                start = float(rng.group(1))
+                end = float(rng.group(2))
+                lower = min(start, end)
+                upper = max(start, end)
+                spec = _make_threshold_spec(
+                    f"range:{_format_threshold_number(lower)}-{_format_threshold_number(upper)}",
+                    lower,
+                    True,
+                    upper,
+                    True,
+                )
+
+        if spec is None:
+            try:
+                value = float(normalized)
+            except Exception:
+                continue
+            spec = _make_threshold_spec(f"exact:{_format_threshold_number(value)}", value, True, value, True)
+
+        if spec["id"] in seen:
+            continue
+        seen.add(spec["id"])
+        specs.append(spec)
+    return specs
+
+
+def _threshold_value_matches(spec: dict[str, Any], value: float) -> bool:
+    lower = spec.get("lower", float("-inf"))
+    upper = spec.get("upper", float("inf"))
+    lower_ok = value >= lower if spec.get("lowerInclusive", True) else value > lower
+    upper_ok = value <= upper if spec.get("upperInclusive", True) else value < upper
+    return lower_ok and upper_ok
+
+
+def _memory_threshold_matches(spec: dict[str, Any], days: Any, mode: str) -> bool:
+    try:
+        raw_value = float(days)
+    except Exception:
+        return False
+    if mode == "review_span":
+        return raw_value >= 1 and _threshold_value_matches(spec, raw_value)
+    if mode == "critical_point":
+        return raw_value >= 0 and _threshold_value_matches(spec, raw_value)
+    if mode == "overdue":
+        if raw_value >= 0:
+            return False
+        upper = spec.get("upper", float("inf"))
+        if upper != float("inf") and upper <= 0:
+            return _threshold_value_matches(spec, raw_value)
+        overdue_age = max(1, abs(int(raw_value // 1)))
+        return _threshold_value_matches(spec, float(overdue_age))
+    return _threshold_value_matches(spec, raw_value)
+
+
+def _new_memory_stats(specs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        "counts": {str(spec["id"]): 0 for spec in specs},
+        "avgs": {str(spec["id"]): None for spec in specs},
+        "_sums": {str(spec["id"]): 0.0 for spec in specs},
+        "_avgCounts": {str(spec["id"]): 0 for spec in specs},
+    }
+
+
+def _add_memory_stat(stats: dict[str, Any], specs: list[dict[str, Any]], days: Any, study_count: float | None, mode: str) -> None:
+    for spec in specs:
+        spec_id = str(spec["id"])
+        if not _memory_threshold_matches(spec, days, mode):
+            continue
+        stats["counts"][spec_id] = int(stats["counts"].get(spec_id) or 0) + 1
+        if study_count is not None and study_count == study_count:
+            stats["_sums"][spec_id] = float(stats["_sums"].get(spec_id) or 0.0) + float(study_count)
+            stats["_avgCounts"][spec_id] = int(stats["_avgCounts"].get(spec_id) or 0) + 1
+
+
+def _finalize_memory_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    sums = stats.pop("_sums", {})
+    counts = stats.pop("_avgCounts", {})
+    for spec_id, total in sums.items():
+        n = int(counts.get(spec_id) or 0)
+        stats["avgs"][spec_id] = (float(total) / n) if n else None
+    return stats
+
 
 def _cache_get(kind: str, day_key: str, snapshot_time: str) -> list[dict[str, Any]] | None:
+    """从重建缓存中读取指定类型、日期和快照时间的数据。"""
     key = (kind, day_key, snapshot_time)
     value = _RECONSTRUCT_CACHE.get(key)
     if value is None:
@@ -48,6 +182,7 @@ def _cache_get(kind: str, day_key: str, snapshot_time: str) -> list[dict[str, An
 
 
 def _cache_put(kind: str, day_key: str, snapshot_time: str, value: list[dict[str, Any]]) -> None:
+    """写入重建缓存，并按 LRU 规则限制缓存容量。"""
     key = (kind, day_key, snapshot_time)
     _RECONSTRUCT_CACHE[key] = [dict(x) for x in value]
     _RECONSTRUCT_CACHE.move_to_end(key)
@@ -56,11 +191,13 @@ def _cache_put(kind: str, day_key: str, snapshot_time: str, value: list[dict[str
 
 
 def db_perf_log(message: str) -> None:
+    """向 stderr 输出带北京时间的数据库性能日志。"""
     ts = now_bj().strftime("%H:%M:%S")
     print(f"[{ts}] DB {message}", file=sys.stderr, flush=True)
 
 
 def _trace_add(trace: list[dict[str, Any]] | None, step: str, elapsed_ms: float, **extra: Any) -> None:
+    """向 trace 列表追加一个步骤耗时记录；trace 为空时静默跳过。"""
     if trace is None:
         return
     item: dict[str, Any] = {"step": step, "ms": round(float(elapsed_ms), 2)}
@@ -71,14 +208,17 @@ def _trace_add(trace: list[dict[str, Any]] | None, step: str, elapsed_ms: float,
 
 
 def _trace_step_start() -> float:
+    """返回当前高精度计时点，用于后续计算步骤耗时。"""
     return time.perf_counter()
 
 
 def _trace_step_done(trace: list[dict[str, Any]] | None, step: str, start: float, **extra: Any) -> None:
+    """根据开始时间计算耗时，并追加到 trace 记录。"""
     _trace_add(trace, step, (time.perf_counter() - start) * 1000, **extra)
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
+    """创建 SQLite 连接，并统一设置 row_factory 与性能相关 PRAGMA。"""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
@@ -91,6 +231,7 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 @contextmanager
 def db_connect(db_path: Path):
+    """数据库连接上下文管理器：退出时提交事务并关闭连接。"""
     conn = connect(db_path)
     try:
         yield conn
@@ -100,19 +241,23 @@ def db_connect(db_path: Path):
 
 
 def now_bj() -> datetime:
+    """返回当前北京时间。"""
     return datetime.now(BJ)
 
 
 def iso_bj(dt: datetime | None = None, *, milliseconds: bool = True) -> str:
+    """把给定时间转换为北京时间 ISO 字符串，默认保留毫秒。"""
     dt = (dt or now_bj()).astimezone(BJ)
     return dt.isoformat(timespec="milliseconds" if milliseconds else "seconds")
 
 
 def snapshot_name(dt: datetime | None = None) -> str:
+    """生成用于快照文件名或标识的北京时间字符串。"""
     return (dt or now_bj()).astimezone(BJ).strftime("%Y.%m.%d_%H-%M-%S")
 
 
 def study_day_key_from_dt(dt: datetime | None = None) -> str:
+    """根据学习日边界小时计算学习日 key；凌晨边界前归入前一天。"""
     dt = (dt or now_bj()).astimezone(BJ)
     if dt.hour < STUDY_DAY_BOUNDARY_HOUR:
         dt = dt - timedelta(days=1)
@@ -120,10 +265,12 @@ def study_day_key_from_dt(dt: datetime | None = None) -> str:
 
 
 def month_key_from_day(day_key: str) -> str:
+    """从 YYYY-MM-DD 日期 key 截取 YYYY-MM 月份 key。"""
     return str(day_key)[:7]
 
 
 def parse_api_datetime(value: str | None) -> datetime | None:
+    """解析 API 时间字符串，并统一转换为北京时间；解析失败返回 None。"""
     if not value:
         return None
     try:
@@ -133,18 +280,25 @@ def parse_api_datetime(value: str | None) -> datetime | None:
 
 
 def json_text(value: Any) -> str:
+    """用紧凑 JSON 格式序列化对象，并保留中文字符。"""
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def stable_hash(value: Any) -> str:
+    """基于稳定 JSON 文本生成 SHA1 哈希。"""
     return sha1(json_text(value).encode("utf-8")).hexdigest()
 
 
 def response_cn(value: str | None) -> str:
+    """把 API 反馈枚举转换为中文文案；未知值原样返回。"""
     return RESPONSE_CN.get(value, value or "")
 
 
+#-----------------
+#转换数据类型工具
+#—————————————————
 def nullable_bool_int(value: Any) -> int | None:
+    """把常见布尔值表示转换为 1/0；无法判断时返回 None。"""
     if value is None:
         return None
     if isinstance(value, bool):
@@ -160,6 +314,7 @@ def nullable_bool_int(value: Any) -> int | None:
 
 
 def nullable_int(value: Any) -> int | None:
+    """把输入转换为整数；空值或转换失败返回 None。"""
     if value in (None, ""):
         return None
     try:
@@ -172,15 +327,20 @@ def nullable_int(value: Any) -> int | None:
 
 
 def nullable_float(value: Any) -> float | None:
+    """把输入转换为浮点数；空值或转换失败返回 None。"""
     if value in (None, ""):
         return None
     try:
         return float(value)
     except Exception:
         return None
+#-----------------
+#转换数据类型工具
+#—————————————————
 
 
 def text_or_none(value: Any) -> str | None:
+    """把非空值转换为字符串；None 或空字符串返回 None。"""
     if value is None:
         return None
     s = str(value)
@@ -188,6 +348,7 @@ def text_or_none(value: Any) -> str | None:
 
 
 def tag_values(tags: Any) -> set[str]:
+    """把标签列表或分隔字符串规范化为标签集合。"""
     if tags is None:
         return set()
     if isinstance(tags, list):
@@ -199,6 +360,7 @@ def tag_values(tags: Any) -> set[str]:
 
 
 def tag_summary(tags: Any) -> tuple[str, str, str]:
+    """汇总标签信息，返回是否熟知、是否顽固和展示文本。"""
     vals = tag_values(tags)
     labels: list[str] = []
     is_well = "WELL_FAMILIAR" in vals
@@ -213,6 +375,7 @@ def tag_summary(tags: Any) -> tuple[str, str, str]:
 
 
 def current_state(last_response: str | None, next_study_date: str | None, reference_day: str) -> tuple[str, str]:
+    """根据最近反馈、下次复习日期和参考日计算当前状态与是否逾期。"""
     next_dt = parse_api_datetime(next_study_date)
     try:
         ref_date = datetime.strptime(reference_day, "%Y-%m-%d").date()
@@ -234,6 +397,7 @@ def current_state(last_response: str | None, next_study_date: str | None, refere
 
 
 def response_bucket(first_response: Any) -> str:
+    """把首次作答枚举归类为统计桶。"""
     raw = str(first_response or "").strip().upper()
     if raw == "FORGET":
         return "forget"
@@ -245,23 +409,28 @@ def response_bucket(first_response: Any) -> str:
 
 
 def response_counts_empty() -> dict[str, int]:
+    """返回一个初始化为 0 的作答统计字典。"""
     return {"known": 0, "vague": 0, "forget": 0, "unknown": 0}
 
 
 def extract_progress(progress_payload: dict[str, Any] | None) -> dict[str, Any]:
+    """从 API progress payload 中提取 progress 节点。"""
     return (((progress_payload or {}).get("data") or {}).get("progress") or {})
 
 
 def extract_today_items(items_payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """从 API today_items payload 中提取有效的今日单词对象列表。"""
     items = (((items_payload or {}).get("data") or {}).get("today_items") or [])
     return [x for x in items if isinstance(x, dict)]
 
 
 def _stable_text_key(value: Any) -> str:
+    """生成用于匹配的稳定小写文本 key。"""
     return str(value or "").strip().casefold()
 
 
 def canonical_voc_id(obj: dict[str, Any] | None) -> str | None:
+    """从对象中提取规范化后的 voc_id。"""
     if not isinstance(obj, dict):
         return None
     value = obj.get("voc_id")
@@ -272,6 +441,7 @@ def canonical_voc_id(obj: dict[str, Any] | None) -> str | None:
 
 
 def canonical_spelling(obj: dict[str, Any] | None) -> str | None:
+    """从对象中提取规范化后的单词拼写。"""
     if not isinstance(obj, dict):
         return None
     value = obj.get("voc_spelling")
@@ -282,6 +452,7 @@ def canonical_spelling(obj: dict[str, Any] | None) -> str | None:
 
 
 def _json_obj(text: Any) -> dict[str, Any]:
+    """把 JSON 文本安全解析为 dict；失败或非 dict 时返回空字典。"""
     if isinstance(text, dict):
         return text
     if not isinstance(text, str) or not text.strip():
@@ -294,6 +465,7 @@ def _json_obj(text: Any) -> dict[str, Any]:
 
 
 def item_key(item: dict[str, Any]) -> str:
+    """生成今日 item 的稳定身份 key，优先使用 voc_id，其次使用 spelling。"""
     voc_id = canonical_voc_id(item)
     if voc_id:
         return f"id:{voc_id}"
@@ -304,6 +476,7 @@ def item_key(item: dict[str, Any]) -> str:
 
 
 def record_key(record: dict[str, Any]) -> str:
+    """生成 overview record 的稳定身份 key，优先使用 voc_id，其次使用 spelling。"""
     voc_id = canonical_voc_id(record)
     if voc_id:
         return f"id:{voc_id}"
@@ -314,6 +487,7 @@ def record_key(record: dict[str, Any]) -> str:
 
 
 def item_payload(item: dict[str, Any], *, present_state: str = "observed") -> dict[str, Any]:
+    """把 API 今日 item 转换为数据库存储用 payload。"""
     return {
         "item_key": item_key(item),
         "voc_id": text_or_none(canonical_voc_id(item)),
@@ -328,6 +502,7 @@ def item_payload(item: dict[str, Any], *, present_state: str = "observed") -> di
 
 
 def item_state_hash(payload: dict[str, Any]) -> str:
+    """根据 item 关键状态字段生成哈希，用于判断状态是否变化。"""
     return stable_hash({
         "voc_id": payload.get("voc_id"),
         "voc_spelling": payload.get("voc_spelling"),
@@ -340,6 +515,7 @@ def item_state_hash(payload: dict[str, Any]) -> str:
 
 
 def record_payload(record: dict[str, Any], reference_day: str) -> dict[str, Any]:
+    """把 API overview record 转换为数据库存储用 payload。"""
     tags = record.get("tags") or []
     tag_well, tag_sticking, tag_text = tag_summary(tags)
     last_response = text_or_none(record.get("last_response"))
@@ -366,6 +542,7 @@ def record_payload(record: dict[str, Any], reference_day: str) -> dict[str, Any]
 
 
 def record_state_hash(payload: dict[str, Any]) -> str:
+    """根据 record 关键状态字段生成哈希，用于判断状态是否变化。"""
     return stable_hash({
         "voc_id": payload.get("voc_id"),
         "spelling": payload.get("spelling"),
@@ -380,10 +557,12 @@ def record_state_hash(payload: dict[str, Any]) -> str:
 
 
 def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """读取 SQLite 表的字段名集合。"""
     return {str(r["name"] if isinstance(r, sqlite3.Row) else r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
 def row_value(row: sqlite3.Row | dict[str, Any] | None, key: str, default: Any = None) -> Any:
+    """兼容 sqlite3.Row 和 dict 的安全取值函数。"""
     if row is None:
         return default
     if isinstance(row, sqlite3.Row):
@@ -392,18 +571,22 @@ def row_value(row: sqlite3.Row | dict[str, Any] | None, key: str, default: Any =
 
 
 def count_response(items: Iterable[dict[str, Any]], response: str) -> int:
+    """统计 item 列表中指定 first_response 的数量。"""
     return sum(1 for x in items if x.get("first_response") == response)
 
 
 def count_new(items: Iterable[dict[str, Any]]) -> int:
+    """统计新学 item 数量。"""
     return sum(1 for x in items if x.get("is_new") is True)
 
 
 def count_review(items: Iterable[dict[str, Any]]) -> int:
+    """统计复习 item 数量。"""
     return sum(1 for x in items if x.get("is_new") is not True)
 
 
 def count_pending_new(items: Iterable[dict[str, Any]]) -> int:
+    """统计未完成的新学 item 数量。"""
     return sum(1 for x in items if x.get("is_new") is True and x.get("is_finished") is not True)
 
 
@@ -651,6 +834,7 @@ class ImportResult:
 
 
 def _date_only(value: str | None) -> str:
+    """从时间字符串中提取日期部分；优先按 API 时间解析。"""
     dt = parse_api_datetime(value)
     if dt:
         return dt.date().isoformat()
@@ -661,6 +845,7 @@ def _date_only(value: str | None) -> str:
 
 
 def _days_between_date_text(a: str | None, b: str | None) -> int | None:
+    """计算两个日期/时间文本的日期差：a - b，失败返回 None。"""
     da = _date_only(a)
     db = _date_only(b)
     if not da or not db:
@@ -672,6 +857,7 @@ def _days_between_date_text(a: str | None, b: str | None) -> int | None:
 
 
 def _sort_value(item: dict[str, Any], sort: str):
+    """根据指定排序字段返回用于排序的值。"""
     state_order = {"逾期": 0, "忘记": 1, "模糊": 2, "认识": 3, "未作答": 4, "": 9}
     if sort == "word":
         return item.get("word") or ""
@@ -699,10 +885,12 @@ def _sort_value(item: dict[str, Any], sort: str):
 
 
 def _date_diff_days(a: str | None, b: str | None) -> float | None:
+    """计算两个日期文本的天数差；当前实现返回整数天或 None。"""
     return _days_between_date_text(a, b)
 
 
 def _today_item_lookup(items: list[dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """为 today items 建立按稳定 key 和 spelling 查询的索引。"""
     by_key: dict[str, dict[str, Any]] = {}
     by_spelling: dict[str, dict[str, Any]] = {}
     for it in items:
@@ -715,6 +903,7 @@ def _today_item_lookup(items: list[dict[str, Any]]) -> tuple[dict[str, dict[str,
 
 
 def _today_item_for_record(record: dict[str, Any], by_key: dict[str, dict[str, Any]], by_spelling: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    """根据 record 在 today item 索引中查找对应 item。"""
     key = record_key(record)
     if key in by_key:
         return by_key[key]
@@ -725,6 +914,7 @@ def _today_item_for_record(record: dict[str, Any], by_key: dict[str, dict[str, A
 
 
 def _matches_due_filter(next_study_date: str, due: str, reference_day: str, overdue_days: int | None) -> bool:
+    """判断 next_study_date 是否命中指定到期筛选条件。"""
     if not due:
         return True
     nd = _date_only(next_study_date)
@@ -751,6 +941,7 @@ def _matches_due_filter(next_study_date: str, due: str, reference_day: str, over
 
 
 def _matches_today_filter(today_item: dict[str, Any] | None, today_filter: str) -> bool:
+    """判断 today item 是否命中指定今日任务筛选条件。"""
     if not today_filter:
         return True
     if today_item is None:
@@ -780,7 +971,7 @@ def _matches_today_filter(today_item: dict[str, Any] | None, today_filter: str) 
     return True
 
 
-def build_dashboard_summary_from_records(records: list[dict[str, Any]], today_items: list[dict[str, Any]], day_key: str, snapshot_time_value: str | None = None) -> dict[str, Any]:
+def build_dashboard_summary_from_records(records: list[dict[str, Any]], today_items: list[dict[str, Any]], day_key: str, snapshot_time_value: str | None = None, *, memory_thresholds_text: str | None = None, include_memory_items: bool = False) -> dict[str, Any]:
     """Build the lightweight summary needed by the dashboard without shipping all word rows."""
     total_study_count = 0.0
     total_study_count_n = 0
@@ -797,16 +988,24 @@ def build_dashboard_summary_from_records(records: list[dict[str, Any]], today_it
         "dailyPendingNewCount": 0,
         "dailyReviewedCount": 0,
         "dailyAllReviewAvgStudyCount": None,
-        "memoryDiffs": [],
-        "memoryDiffItems": [],
-        "memoryReviewSpanItems": [],
-        "memoryNextDueItems": [],
-        "memoryReviewOutcomeItems": [],
         "newLearnedResponseCounts": response_counts_empty(),
         "newLearnedResponseSampleCount": 0,
         "newLearnedResponseExcludedDate": "2026-05-11",
         "memoryReferenceNowUtc": day_key,
     }
+    if include_memory_items:
+        out.update({
+            "memoryDiffs": [],
+            "memoryDiffItems": [],
+            "memoryReviewSpanItems": [],
+            "memoryNextDueItems": [],
+            "memoryReviewOutcomeItems": [],
+        })
+
+    memory_specs = parse_memory_threshold_specs_from_text(memory_thresholds_text) or parse_memory_threshold_specs_from_text(FALLBACK_MEMORY_THRESHOLDS)
+    review_span_stats = _new_memory_stats(memory_specs)
+    critical_stats = _new_memory_stats(memory_specs)
+    overdue_stats = _new_memory_stats(memory_specs)
 
     today_by_key, today_by_spelling = _today_item_lookup(today_items)
     review_keys: set[str] = set()
@@ -868,23 +1067,28 @@ def build_dashboard_summary_from_records(records: list[dict[str, Any]], today_it
                 "lastStudyDate": _date_only(p.get("last_study_date")) or (p.get("last_study_date") or ""),
                 "nextStudyDate": _date_only(p.get("next_study_date")) or (p.get("next_study_date") or ""),
             }
-            out["memoryDiffs"].append(span_days)
-            out["memoryDiffItems"].append(item)
-            out["memoryReviewSpanItems"].append(item)
+            _add_memory_stat(review_span_stats, memory_specs, span_days, study_count_f if study_count_f == study_count_f else None, "review_span")
+            if include_memory_items:
+                out["memoryDiffs"].append(span_days)
+                out["memoryDiffItems"].append(item)
+                out["memoryReviewSpanItems"].append(item)
 
         critical_days = _date_diff_days(p.get("next_study_date"), f"{day_key}T12:00:00+08:00")
         if critical_days is not None:
-            out["memoryNextDueItems"].append({
-                "days": critical_days,
-                "studyCount": study_count_f if study_count_f == study_count_f else None,
-                "state": state,
-                "word": word_label,
-                "vocId": voc_id,
-                "addDate": _date_only(p.get("add_date")) or (p.get("add_date") or ""),
-                "firstStudyDate": _date_only(p.get("first_study_date")) or (p.get("first_study_date") or ""),
-                "lastStudyDate": _date_only(p.get("last_study_date")) or (p.get("last_study_date") or ""),
-                "nextStudyDate": _date_only(p.get("next_study_date")) or (p.get("next_study_date") or ""),
-            })
+            _add_memory_stat(critical_stats, memory_specs, critical_days, study_count_f if study_count_f == study_count_f else None, "critical_point")
+            _add_memory_stat(overdue_stats, memory_specs, critical_days, study_count_f if study_count_f == study_count_f else None, "overdue")
+            if include_memory_items:
+                out["memoryNextDueItems"].append({
+                    "days": critical_days,
+                    "studyCount": study_count_f if study_count_f == study_count_f else None,
+                    "state": state,
+                    "word": word_label,
+                    "vocId": voc_id,
+                    "addDate": _date_only(p.get("add_date")) or (p.get("add_date") or ""),
+                    "firstStudyDate": _date_only(p.get("first_study_date")) or (p.get("first_study_date") or ""),
+                    "lastStudyDate": _date_only(p.get("last_study_date")) or (p.get("last_study_date") or ""),
+                    "nextStudyDate": _date_only(p.get("next_study_date")) or (p.get("next_study_date") or ""),
+                })
 
         rec_key = record_key(p)
         spelling_key = _stable_text_key(p.get("spelling"))
@@ -894,18 +1098,22 @@ def build_dashboard_summary_from_records(records: list[dict[str, Any]], today_it
             if span_days is not None:
                 resp_item = today_by_key.get(rec_key) or (today_by_spelling.get(spelling_key) if spelling_key else None)
                 if resp_item and resp_item.get("is_finished") is True and resp_item.get("is_new") is False:
-                    out["memoryReviewOutcomeItems"].append({
-                        "days": span_days,
-                        "studyCount": study_count_f if study_count_f == study_count_f else None,
-                        "response": response_bucket(resp_item.get("first_response")),
-                        "word": word_label,
-                        "vocId": voc_id,
-                        "addDate": _date_only(p.get("add_date")) or (p.get("add_date") or ""),
-                        "firstStudyDate": _date_only(p.get("first_study_date")) or (p.get("first_study_date") or ""),
-                        "lastStudyDate": _date_only(p.get("last_study_date")) or (p.get("last_study_date") or ""),
-                        "nextStudyDate": _date_only(p.get("next_study_date")) or (p.get("next_study_date") or ""),
-                    })
+                    if include_memory_items:
+                        out["memoryReviewOutcomeItems"].append({
+                            "days": span_days,
+                            "studyCount": study_count_f if study_count_f == study_count_f else None,
+                            "response": response_bucket(resp_item.get("first_response")),
+                            "word": word_label,
+                            "vocId": voc_id,
+                            "addDate": _date_only(p.get("add_date")) or (p.get("add_date") or ""),
+                            "firstStudyDate": _date_only(p.get("first_study_date")) or (p.get("first_study_date") or ""),
+                            "lastStudyDate": _date_only(p.get("last_study_date")) or (p.get("last_study_date") or ""),
+                            "nextStudyDate": _date_only(p.get("next_study_date")) or (p.get("next_study_date") or ""),
+                        })
 
+    out["memoryReviewSpanStats"] = _finalize_memory_stats(review_span_stats)
+    out["memoryCriticalStats"] = _finalize_memory_stats(critical_stats)
+    out["memoryOverdueStats"] = _finalize_memory_stats(overdue_stats)
     out["avgStudyCount"] = (total_study_count / total_study_count_n) if total_study_count_n else 0
     out["dailyNewLearnedCount"] = sum(1 for x in today_items if x.get("is_new") is True and x.get("is_finished") is True and x.get("present_state") != "confirmed_absent")
     out["dailyPendingNewCount"] = sum(1 for x in today_items if x.get("is_new") is True and x.get("is_finished") is not True and x.get("present_state") != "confirmed_absent")
@@ -915,12 +1123,14 @@ def build_dashboard_summary_from_records(records: list[dict[str, Any]], today_it
 
 
 def parse_snapshot_display_time(captured_at: str) -> int:
+    """把快照时间字符串转换为毫秒时间戳；解析失败返回 0。"""
     try:
         return int(datetime.fromisoformat(str(captured_at)).timestamp() * 1000)
     except Exception:
         return 0
 
 
+#返回单词结构
 def enrich_today_items_with_prediction_raw_data(items: list[dict[str, Any]], overview_records: list[dict[str, Any]], day_key: str, snapshot_time: str | None = None, conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
     """Attach memory fields from the same historical input chain used by FSRS.
 
@@ -936,6 +1146,7 @@ def enrich_today_items_with_prediction_raw_data(items: list[dict[str, Any]], ove
         return items
 
     def _num_or_none(value: Any) -> float | None:
+        """把输入转换为 float；空值或转换失败返回 None。"""
         if value is None or value == "":
             return None
         try:
@@ -999,7 +1210,7 @@ def enrich_today_items_with_prediction_raw_data(items: list[dict[str, Any]], ove
 
     if overview_records:
         try:
-            raw_summary = build_dashboard_summary_from_records(overview_records, items, day_key, snapshot_time)
+            raw_summary = build_dashboard_summary_from_records(overview_records, items, day_key, snapshot_time, include_memory_items=True)
         except Exception:
             raw_summary = {}
 
@@ -1085,5 +1296,6 @@ def enrich_today_items_with_prediction_raw_data(items: list[dict[str, Any]], ove
 
         out.append(merged)
     return out
+
 
 __all__ = [name for name in globals() if not name.startswith('__')]

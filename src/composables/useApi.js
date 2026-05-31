@@ -35,13 +35,23 @@ export function useApi() {
     }
   }
 
-  async function fetchDashboardPage(offset = 0, limit = 3, includeMeta = true, order = 'asc') {
-    return fetchJson(`/api/dashboard-data-page?offset=${offset}&limit=${limit}&includeMeta=${includeMeta ? 1 : 0}&order=${order}`)
+  async function fetchDashboardPage(offset = 0, limit = 3, order = 'asc', options = {}) {
+    const params = new URLSearchParams({
+      offset: String(offset),
+      limit: String(limit),
+      order: String(order || 'asc'),
+    })
+    if (options.memoryThresholds) params.set('memoryThresholds', String(options.memoryThresholds))
+    return fetchJson(`/api/dashboard-data-page?${params.toString()}`)
+  }
+
+  async function fetchAlerts() {
+    return fetchJson('/api/alerts')
   }
 
   async function fetchTodayWorkspace(date) {
-    const q = date ? `&date=${encodeURIComponent(date)}` : ''
-    return fetchJson(`/api/dashboard-data-page?workspaceOnly=1${q}`)
+    const q = date ? `?date=${encodeURIComponent(date)}` : ''
+    return fetchJson(`/api/today-workspace${q}`)
   }
 
   async function fetchNotepads(limit = 10, offset = 0) {
@@ -129,11 +139,16 @@ export function useApi() {
     return postJson('/api/study/advance', payload, { cloudWrite: true })
   }
 
+  async function fetchFsrsPrediction(payload = {}) {
+    return postJson('/api/fsrs-prediction', payload)
+  }
+
   return {
     loading,
     error,
     fetchJson,
     fetchDashboardPage,
+    fetchAlerts,
     fetchTodayWorkspace,
     fetchNotepads,
     fetchNotepad,
@@ -144,5 +159,6 @@ export function useApi() {
     addWordsToNotepad,
     analyzeArticle,
     advanceStudyWords,
+    fetchFsrsPrediction,
   }
 }

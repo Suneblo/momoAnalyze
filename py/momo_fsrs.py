@@ -17,7 +17,10 @@ from typing import Any
 
 from momo_config import memory_algorithm_config
 
-DEFAULT_CONFIG: dict[str, Any] = memory_algorithm_config()
+try:
+    DEFAULT_CONFIG: dict[str, Any] = memory_algorithm_config()
+except Exception:
+    DEFAULT_CONFIG = {}
 
 
 RATING_NAME_BY_RESPONSE = {
@@ -457,7 +460,10 @@ def _review_interval_for_rating(scheduler: Any, card: Any, rating: Any, review_d
 
 
 def build_fsrs_dashboard_payload(conn: sqlite3.Connection, root_dir: Path | None = None) -> dict[str, Any]:
-    config = load_memory_algorithm_config(root_dir)
+    try:
+        config = load_memory_algorithm_config(root_dir)
+    except Exception as exc:
+        return {"available": False, "enabled": False, "message": f"读取 FSRS 配置失败：{exc}", "config": {}}
     if not config.get("enabled", True):
         return {"available": False, "enabled": False, "message": "config/app.json 已关闭 FSRS 预测。", "config": config}
 
@@ -611,3 +617,463 @@ def build_fsrs_dashboard_payload(conn: sqlite3.Connection, root_dir: Path | None
             "message": f"FSRS 预测计算失败：{exc}",
             "config": config,
         }
+
+# ---------------------------------------------------------------------------
+# Frontend prediction payload adapter
+# ---------------------------------------------------------------------------
+
+RATING_TO_RESPONSE_KEY = {
+    "忘记": "again",
+    "模糊": "hard",
+    "认识": "good",
+    "熟知": "easy",
+}
+
+
+def _frontend_deterministic_noise(seed: Any) -> float:
+    x = math.sin(float(seed or 1) * 12.9898 + 78.233) * 43758.5453
+    return x - math.floor(x)
+
+
+def _frontend_pick_rating(distribution: list[dict[str, Any]], seed: Any) -> str:
+    r = _frontend_deterministic_noise(seed)
+    acc = 0.0
+    for item in distribution or []:
+        acc += float(item.get("prob") or 0.0)
+        if r <= acc:
+            return str(item.get("rating") or "good")
+    return "good"
+
+
+def _frontend_add_days(date_text: str, days: int) -> str:
+    base = _to_utc_datetime(date_text) or datetime.now(timezone.utc)
+    return (base + timedelta(days=int(days or 0))).date().isoformat()
+
+
+def _frontend_bucket_memory(days: Any, settings: dict[str, Any]) -> dict[str, Any]:
+    try:
+        value = max(1, round(float(days or 1)))
+    except Exception:
+        value = 1
+    base = max(1.1, float(settings.get("logBase") or 2))
+    width = max(0.1, float(settings.get("bucketSize") or 1))
+    log_value = math.log(value) / math.log(base)
+    start_exp = math.floor(log_value / width) * width
+    end_exp = start_exp + width
+    lower = max(1, math.floor(base ** start_exp))
+    upper = max(lower, max(lower, math.ceil(base ** end_exp) - 1))
+    key = f"{lower}-{upper}"
+    return {"key": key, "label": f"{lower}天" if lower == upper else f"{lower}-{upper}天", "lower": lower, "upper": upper, "center": (lower + upper) / 2}
+
+
+def _frontend_bucket_study_count(count: Any, settings: dict[str, Any]) -> dict[str, Any]:
+    try:
+        value = max(0, round(float(count or 0)))
+    except Exception:
+        value = 0
+    width = max(1, round(float(settings.get("studyCountBucketSize") or 5)))
+    lower = math.floor(value / width) * width
+    upper = lower + width - 1
+    key = f"{lower}-{upper}"
+    return {"key": key, "label": str(lower) if lower == upper else f"{lower}-{upper}", "lower": lower, "upper": upper, "center": (lower + upper) / 2}
+
+
+def _empty_probability_counts() -> dict[str, float]:
+    return {"n": 0.0, "again": 0.0, "hard": 0.0, "good": 0.0, "easy": 0.0}
+
+
+def _prob_distribution_from_counts(counts: dict[str, Any], fallback: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    n = float(counts.get("n") or 0.0)
+    if n <= 0:
+        return fallback or [
+            {"rating": "again", "prob": 0.15},
+            {"rating": "hard", "prob": 0.25},
+            {"rating": "good", "prob": 0.5},
+            {"rating": "easy", "prob": 0.1},
+        ]
+    return [{"rating": rating, "prob": max(0.0, float(counts.get(rating) or 0.0)) / n} for rating in ("again", "hard", "good", "easy")]
+
+
+def _prob_object_from_distribution(distribution: list[dict[str, Any]]) -> dict[str, float]:
+    return {str(item.get("rating")): float(item.get("prob") or 0.0) for item in distribution}
+
+
+def _normalize_probability_distribution(again: Any, hard: Any, good: Any, easy: Any = 0.0) -> list[dict[str, Any]]:
+    vals = {
+        "again": max(0.0, float(again or 0.0)),
+        "hard": max(0.0, float(hard or 0.0)),
+        "good": max(0.0, float(good or 0.0)),
+        "easy": max(0.0, float(easy or 0.0)),
+    }
+    total = sum(vals.values())
+    if total <= 0:
+        vals = {"again": 0.15, "hard": 0.25, "good": 0.5, "easy": 0.1}
+        total = 1.0
+    return [{"rating": key, "prob": value / total} for key, value in vals.items()]
+
+
+def _build_frontend_probability_model(items: list[dict[str, Any]], probability_settings: dict[str, Any]) -> dict[str, Any]:
+    settings = {
+        "logBase": max(1.1, float(probability_settings.get("logBase") or 2)),
+        "bucketSize": max(0.1, float(probability_settings.get("bucketSize") or 1)),
+        "studyCountBucketSize": max(1, round(float(probability_settings.get("studyCountBucketSize") or 5))),
+        "useStudyCountDimension": probability_settings.get("useStudyCountDimension") is not False,
+        "minCoordinateSamples": max(4, round(float(probability_settings.get("minCoordinateSamples") or 4))),
+    }
+    memory_buckets: dict[str, dict[str, Any]] = {}
+    study_buckets: dict[str, dict[str, Any]] = {}
+    by_memory_counts: dict[str, dict[str, float]] = {}
+    by_key_counts: dict[str, dict[str, Any]] = {}
+    global_counts = _empty_probability_counts()
+
+    for idx, item in enumerate(items, start=1):
+        memory = _frontend_bucket_memory(item.get("currentIntervalDays") or item.get("expectedNextIntervalDays") or 1, settings)
+        study = _frontend_bucket_study_count(item.get("studyCount") or 0, settings)
+        memory_buckets.setdefault(memory["key"], memory)
+        study_buckets.setdefault(study["key"], study)
+        dist = _normalize_probability_distribution(item.get("forgetProbability"), item.get("vagueProbability"), item.get("familiarProbability"), 0.0)
+        probs = _prob_object_from_distribution(dist)
+        mem_counts = by_memory_counts.setdefault(memory["key"], _empty_probability_counts())
+        coord_key = f"{memory['key']}|{study['key']}"
+        coord = by_key_counts.setdefault(coord_key, {
+            "key": coord_key,
+            "memoryKey": memory["key"],
+            "memoryLabel": memory["label"],
+            "memorySort": memory["lower"],
+            "studyKey": study["key"],
+            "studyLabel": study["label"],
+            "studySort": study["lower"],
+            "counts": _empty_probability_counts(),
+            "samples": [],
+        })
+        for rating in ("again", "hard", "good", "easy"):
+            mem_counts[rating] += probs.get(rating, 0.0)
+            coord["counts"][rating] += probs.get(rating, 0.0)
+            global_counts[rating] += probs.get(rating, 0.0)
+        mem_counts["n"] += 1
+        coord["counts"]["n"] += 1
+        global_counts["n"] += 1
+        if len(coord["samples"]) < 12:
+            coord["samples"].append(str(item.get("word") or f"样本{idx}"))
+
+    fallback_distribution = _prob_distribution_from_counts(global_counts)
+    memory_rows = []
+    for bucket in sorted(memory_buckets.values(), key=lambda row: row["lower"]):
+        counts = by_memory_counts.get(bucket["key"]) or _empty_probability_counts()
+        distribution = _prob_distribution_from_counts(counts, fallback_distribution)
+        probs = _prob_object_from_distribution(distribution)
+        memory_rows.append({**bucket, **counts, "n": counts.get("n", 0), "total": counts.get("n", 0), "probs": probs, "distribution": distribution})
+
+    by_memory = {row["key"]: row for row in memory_rows}
+    by_key: dict[str, dict[str, Any]] = {}
+    for key, coord in by_key_counts.items():
+        counts = coord.get("counts") or _empty_probability_counts()
+        distribution = _prob_distribution_from_counts(counts, fallback_distribution)
+        probs = _prob_object_from_distribution(distribution)
+        by_key[key] = {
+            **coord,
+            "n": int(round(float(counts.get("n") or 0))),
+            "total": int(round(float(counts.get("n") or 0))),
+            "counts": {k: (int(round(v)) if k == "n" else v) for k, v in counts.items()},
+            "modelCounts": counts,
+            "again": probs.get("again", 0.0) * float(counts.get("n") or 0),
+            "hard": probs.get("hard", 0.0) * float(counts.get("n") or 0),
+            "good": probs.get("good", 0.0) * float(counts.get("n") or 0),
+            "easy": probs.get("easy", 0.0) * float(counts.get("n") or 0),
+            "probs": probs,
+            "distribution": distribution,
+            "usedNearestFallback": False,
+            "fallbackMethod": "self",
+            "diffusionRadius": 0,
+        }
+
+    return {
+        "settings": settings,
+        "useStudyCountDimension": settings["useStudyCountDimension"],
+        "memoryBuckets": memory_rows,
+        "studyBuckets": sorted(study_buckets.values(), key=lambda row: row["lower"]),
+        "byKey": by_key,
+        "rawByKey": by_key,
+        "byMemory": by_memory,
+        "memoryByKey": by_memory,
+        "globalCounts": {k: (int(round(v)) if k == "n" else v) for k, v in global_counts.items()},
+        "globalDistribution": fallback_distribution,
+        "reviewSampleCount": int(round(float(global_counts.get("n") or 0))),
+        "excludedNewSampleCount": 0,
+        "minCoordinateSamples": settings["minCoordinateSamples"],
+    }
+
+
+def _apply_frontend_interval(prev_stability: Any, rating: str, word: dict[str, Any]) -> float:
+    try:
+        prev = max(0.5, float(prev_stability or 1.0))
+    except Exception:
+        prev = 1.0
+    if rating == "again":
+        raw = word.get("intervalIfForgetDays")
+        return max(1.0, float(raw or 1.0))
+    if rating == "hard":
+        raw = word.get("intervalIfVagueDays")
+        return max(1.0, float(raw or max(prev * 1.15, prev * 0.8)))
+    if rating == "easy":
+        return max(2.0, prev * 3.2)
+    raw = word.get("intervalIfFamiliarDays")
+    return max(1.0, float(raw or max(prev * 2.2, prev)))
+
+
+def _prediction_distribution_for_word(word: dict[str, Any], global_distribution: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    distribution = word.get("distribution")
+    if isinstance(distribution, list) and distribution:
+        return distribution
+    return global_distribution or _normalize_probability_distribution(0.15, 0.25, 0.5, 0.1)
+
+
+def _count_frontend_target_words(words: dict[str, dict[str, Any]], target_settings: dict[str, Any], current_day: int) -> int:
+    try:
+        target_days = max(0.0, float(target_settings.get("days") or 0))
+    except Exception:
+        target_days = 0.0
+    metric = str(target_settings.get("metric") or "review_span")
+    count = 0
+    if metric == "critical_point":
+        for word in words.values():
+            next_due = float(word.get("nextDueDay") or 10**9) - current_day
+            if next_due > target_days:
+                count += 1
+        return count
+    for word in words.values():
+        try:
+            if float(word.get("stability") or 0) > target_days:
+                count += 1
+        except Exception:
+            pass
+    return count
+
+
+def _build_frontend_prediction_result(fsrs_payload: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
+    items = list(fsrs_payload.get("items") or [])
+    horizon_days = max(1, int(options.get("horizonDays") or 30))
+    daily_base = max(0, int(float(options.get("dailyBaseValue") or 0)))
+    daily_mode = "fixed_total" if options.get("dailyMode") == "fixed_total" else "fixed_new"
+    review_limit_raw = options.get("reviewLimit")
+    review_limit = None if review_limit_raw in (None, "") else max(0, int(float(review_limit_raw or 0)))
+    defer_overflow = options.get("deferOverflow") is not False
+    target_settings = options.get("targetSettings") if isinstance(options.get("targetSettings"), dict) else {"metric": "review_span", "days": 30, "count": ""}
+    probability_settings = options.get("probabilitySettings") if isinstance(options.get("probabilitySettings"), dict) else {}
+    probability_model = _build_frontend_probability_model(items, probability_settings)
+    global_distribution = probability_model.get("globalDistribution") or _normalize_probability_distribution(0.15, 0.25, 0.5, 0.1)
+    latest_date = str(fsrs_payload.get("referenceDate") or datetime.now(timezone.utc).date().isoformat())
+
+    queues: dict[int, list[dict[str, Any]]] = {}
+    active_words: dict[str, dict[str, Any]] = {}
+    for idx, item in enumerate(items, start=1):
+        key = str(item.get("recordKey") or item.get("word") or f"word-{idx}")
+        stability = max(1.0, float(item.get("currentIntervalDays") or item.get("expectedNextIntervalDays") or 1.0))
+        study_count = max(0, int(float(item.get("studyCount") or 0)))
+        distribution = _normalize_probability_distribution(item.get("forgetProbability"), item.get("vagueProbability"), item.get("familiarProbability"), 0.0)
+        due_day = max(1, int(round(float(item.get("nextDueOffsetDays") or 1))))
+        word = {
+            "key": key,
+            "word": str(item.get("word") or key),
+            "source": "known",
+            "stability": stability,
+            "studyCount": study_count,
+            "seed": max(1, idx) * 1009 + max(1, int(round(stability))),
+            "distribution": distribution,
+            "nextDueDay": due_day,
+            "intervalIfForgetDays": item.get("intervalIfForgetDays"),
+            "intervalIfVagueDays": item.get("intervalIfVagueDays"),
+            "intervalIfFamiliarDays": item.get("intervalIfFamiliarDays"),
+        }
+        active_words[key] = word
+        queues.setdefault(due_day, []).append(word)
+
+    rows_out: list[dict[str, Any]] = []
+    day_word_ratings: list[dict[str, Any]] = []
+    day_word_details: list[dict[str, Any]] = []
+    cumulative_new = 0
+    cumulative_review = 0
+    generated_index = 0
+
+    for day in range(1, horizon_days + 1):
+        current_date = _frontend_add_days(latest_date, day)
+        due = queues.pop(day, [])
+        review_capacity = len(due)
+        predicted_new = daily_base
+        if daily_mode == "fixed_total":
+            total_capacity = daily_base
+            review_capacity = min(len(due), total_capacity)
+            predicted_new = max(0, total_capacity - review_capacity)
+        elif review_limit is not None:
+            review_capacity = min(len(due), review_limit)
+
+        reviews_today = due[:review_capacity]
+        overflow = due[review_capacity:]
+        if defer_overflow or daily_mode == "fixed_new":
+            for word in overflow:
+                word["nextDueDay"] = day + 1
+                queues.setdefault(day + 1, []).append(word)
+        carried_review = len(overflow)
+
+        day_events: list[dict[str, Any]] = []
+        known_old_review = 0
+        generated_review = 0
+        for word in reviews_today:
+            if word.get("source") == "generated":
+                generated_review += 1
+            else:
+                known_old_review += 1
+            distribution = _prediction_distribution_for_word(word, global_distribution)
+            rating = _frontend_pick_rating(distribution, float(word.get("seed") or 1) + day * 97 + int(word.get("studyCount") or 0) * 7919)
+            prev_stability = float(word.get("stability") or 1.0)
+            next_stability = _apply_frontend_interval(prev_stability, rating, word)
+            word["stability"] = next_stability
+            word["studyCount"] = int(word.get("studyCount") or 0) + 1
+            next_due_day = day + max(1, int(round(next_stability)))
+            word["nextDueDay"] = next_due_day
+            queues.setdefault(next_due_day, []).append(word)
+            bucket = _frontend_bucket_memory(prev_stability, probability_model.get("settings") or {})
+            study_bucket = _frontend_bucket_study_count(word.get("studyCount") or 0, probability_model.get("settings") or {})
+            event = {
+                "day": day,
+                "date": current_date,
+                "action": "review",
+                "actionLabel": "模拟词复习" if word.get("source") == "generated" else "库存词复习",
+                "word": word.get("word"),
+                "key": word.get("key"),
+                "source": word.get("source"),
+                "sourceLabel": "模拟词" if word.get("source") == "generated" else "库存词",
+                "rating": rating,
+                "prevStability": prev_stability,
+                "nextStability": next_stability,
+                "nextDueDay": next_due_day,
+                "studyCount": word.get("studyCount"),
+                "probabilityBucket": f"{bucket.get('label')} × {study_bucket.get('label')}次",
+                "probabilityCellText": "-",
+                "probabilitySource": "后端 FSRS 概率",
+                "probabilityN": 0,
+                "probabilityDiffusionRadius": None,
+            }
+            day_events.append(event)
+            day_word_ratings.append(event)
+
+        for _ in range(predicted_new):
+            generated_index += 1
+            key = f"new-{generated_index}"
+            word = {
+                "key": key,
+                "word": f"新词{generated_index}",
+                "source": "generated",
+                "stability": 1.0,
+                "studyCount": 1,
+                "seed": 1000003 + generated_index * 17,
+                "distribution": global_distribution,
+                "nextDueDay": day + 1,
+            }
+            active_words[key] = word
+            queues.setdefault(day + 1, []).append(word)
+            event = {
+                "day": day,
+                "date": current_date,
+                "action": "new",
+                "actionLabel": "模拟词新学",
+                "word": word["word"],
+                "key": key,
+                "source": "generated",
+                "sourceLabel": "模拟词",
+                "rating": "new",
+                "prevStability": 0,
+                "nextStability": 1,
+                "nextDueDay": day + 1,
+                "studyCount": 1,
+                "probabilityBucket": "新学：无复习概率分桶",
+                "probabilityCellText": "-",
+                "probabilitySource": "新学不抽复习概率",
+                "probabilityN": 0,
+                "probabilityDiffusionRadius": None,
+            }
+            day_events.append(event)
+            day_word_ratings.append(event)
+
+        cumulative_new += predicted_new
+        cumulative_review += len(reviews_today)
+        target_matched = _count_frontend_target_words(active_words, target_settings, day)
+        target_count = max(0, int(float(target_settings.get("count") or 0))) if isinstance(target_settings, dict) else 0
+        rows_out.append({
+            "predictionDay": day,
+            "futureDayLabel": day,
+            "futureDayTitle": f"第{day}天",
+            "date": current_date,
+            "predictedNew": predicted_new,
+            "predictedReview": len(reviews_today),
+            "predictedTotal": predicted_new + len(reviews_today),
+            "cumulativeNew": cumulative_new,
+            "cumulativeReview": cumulative_review,
+            "knownOldReview": known_old_review,
+            "generatedReview": generated_review,
+            "deferredReview": carried_review,
+            "carriedReview": carried_review,
+            "reviewCapacity": review_limit,
+            "reviewLimit": review_limit,
+            "dailyTargetMatchedCount": target_matched,
+            "familiarAboveTarget": target_matched,
+            "criticalAboveTarget": target_matched,
+            "targetCount": target_count,
+            "targetDays": target_settings.get("days") if isinstance(target_settings, dict) else 30,
+            "targetMetric": target_settings.get("metric") if isinstance(target_settings, dict) else "review_span",
+            "words": day_events,
+        })
+        day_word_details.append({"day": day, "date": current_date, "words": day_events})
+
+    dist = probability_model.get("globalDistribution") or global_distribution
+    label_map = {"again": "忘", "hard": "模", "good": "认", "easy": "Easy"}
+    dist_summary = {
+        "global": " / ".join(f"{label_map.get(str(x.get('rating')), x.get('rating'))}:{round(float(x.get('prob') or 0) * 100)}%" for x in dist),
+        "sampleCount": probability_model.get("globalCounts", {}).get("n") or 0,
+    }
+    return {
+        "rows": rows_out,
+        "dailyBase": daily_base,
+        "dailyMode": daily_mode,
+        "reviewLimit": review_limit,
+        "initMode": options.get("initMode") or "backend_fsrs",
+        "ratingMapping": options.get("ratingMapping") or {},
+        "targetSettings": target_settings,
+        "simulationWordCount": len(active_words),
+        "availableSimulationWordCount": len(items),
+        "probabilityModel": probability_model,
+        "distSummary": dist_summary,
+        "fsrsProfile": {"ratingDistribution": dist},
+        "dayWordRatings": day_word_ratings,
+        "dayWordDetails": day_word_details,
+        "referenceDate": latest_date,
+        "backendFsrs": {
+            "itemCount": fsrs_payload.get("itemCount"),
+            "currentWordCount": fsrs_payload.get("currentWordCount"),
+            "historyWordCount": fsrs_payload.get("historyWordCount"),
+            "message": fsrs_payload.get("message"),
+        },
+    }
+
+
+def build_fsrs_prediction_result(conn: sqlite3.Connection, options: dict[str, Any] | None = None, root_dir: Path | None = None) -> dict[str, Any]:
+    """Build the frontend prediction.result shape from backend FSRS inputs.
+
+    The heavy per-word dashboard memory arrays are no longer required by the
+    browser.  This uses daily latest overview states to recover per-word review
+    events, then returns the same high-level shape the Vue cards already render.
+    """
+    options = options if isinstance(options, dict) else {}
+    fsrs_payload = build_fsrs_dashboard_payload(conn, root_dir=root_dir)
+    if not fsrs_payload.get("available"):
+        return {
+            "rows": [],
+            "probabilityModel": None,
+            "distSummary": {"global": "", "sampleCount": 0},
+            "dayWordRatings": [],
+            "dayWordDetails": [],
+            "referenceDate": fsrs_payload.get("referenceDate") or "",
+            "backendFsrs": fsrs_payload,
+            "message": fsrs_payload.get("message") or "FSRS 不可用",
+        }
+    return _build_frontend_prediction_result(fsrs_payload, options)

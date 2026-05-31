@@ -168,22 +168,15 @@ function thresholdValueMatches(spec, value) {
   return lowerOk && upperOk
 }
 
+function countFromStats(row, statKey, spec) {
+  const value = row?.[statKey]?.counts?.[spec?.id]
+  const n = Number(value)
+  return Number.isFinite(n) ? n : null
+}
+
 export function countReviewSpanForThreshold(row, spec) {
-  const items = Array.isArray(row?.memoryReviewSpanItems)
-    ? row.memoryReviewSpanItems
-    : Array.isArray(row?.memoryDiffItems)
-      ? row.memoryDiffItems
-      : []
-
-  if (items.length) {
-    return items.filter(item => memoryThresholdMatches(spec, item.days, MEMORY_MODE_REVIEW_SPAN)).length
-  }
-
-  if (Array.isArray(row?.memoryDiffs)) {
-    return row.memoryDiffs.filter(days => memoryThresholdMatches(spec, days, MEMORY_MODE_REVIEW_SPAN)).length
-  }
-
-  return 0
+  const statCount = countFromStats(row, 'memoryReviewSpanStats', spec)
+  return statCount !== null ? statCount : 0
 }
 
 export function sortRowsByDateAsc(rows) {
@@ -192,13 +185,13 @@ export function sortRowsByDateAsc(rows) {
 
 
 export function countCriticalPointForThreshold(row, spec) {
-  const items = Array.isArray(row?.memoryNextDueItems) ? row.memoryNextDueItems : []
-  return items.filter(item => memoryThresholdMatches(spec, item.days, MEMORY_MODE_CRITICAL_POINT)).length
+  const statCount = countFromStats(row, 'memoryCriticalStats', spec)
+  return statCount !== null ? statCount : 0
 }
 
 export function countOverdueForThreshold(row, spec) {
-  const items = Array.isArray(row?.memoryNextDueItems) ? row.memoryNextDueItems : []
-  return items.filter(item => memoryThresholdMatches(spec, item.days, MEMORY_MODE_OVERDUE)).length
+  const statCount = countFromStats(row, 'memoryOverdueStats', spec)
+  return statCount !== null ? statCount : 0
 }
 
 export function getCriticalPointThresholds(inputText) {

@@ -254,10 +254,15 @@ onBeforeUnmount(() => {
 async function reloadData() {
   isReloading.value = true
   try {
-    const data = await api.fetchDashboardPage(0, 200, true, 'asc')
+    const data = await api.fetchDashboardPage(0, 60, 'asc', { memoryThresholds: settings.memoryThresholds })
     if (data?.days) {
       dataStore.setDashboardData(data)
       log(`加载完成：扫描 ${data.total || 0} 天，当前范围 ${dataStore.renderMeta.start || '-'} ~ ${dataStore.renderMeta.end || '-'}，显示 ${dataStore.renderMeta.dataDays || 0} 天`)
+    }
+
+    const alertData = await api.fetchAlerts()
+    if (alertData?.success) {
+      dataStore.setAlerts(alertData.alerts || [])
     }
   } finally {
     isReloading.value = false

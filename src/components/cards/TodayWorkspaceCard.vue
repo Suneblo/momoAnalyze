@@ -110,6 +110,7 @@ import { useApi } from '@/composables/useApi'
 
 const COPY_STATE_KEY = 'momoTodayWorkspaceCopyState'
 const INITIAL_SNAPSHOT_NAME = '__INITIAL_ZERO__'
+const REAL_RESPONSES = new Set(['FAMILIAR', 'VAGUE', 'FORGET', '认识', '模糊', '忘记'])
 
 function loadSavedCopyState() {
   try {
@@ -166,14 +167,38 @@ function formatDurationCN(ms) {
   return `${sign}${s.toFixed(1)}秒`
 }
 
+function rawResponse(item) {
+  return String(item?.first_response ?? item?.firstResponse ?? '').trim()
+}
+
 function respCn(value) {
   const map = {
     FAMILIAR: '认识',
     VAGUE: '模糊',
     FORGET: '忘记',
     STUDY_RESPONSE_UNSPECIFIED: '未作答',
+    '': '未作答',
   }
   return map[value] || value || ''
+}
+
+function normalizedResponse(item) {
+  return respCn(rawResponse(item)) || '未作答'
+}
+
+function hasRealResponse(item) {
+  const value = rawResponse(item)
+  return REAL_RESPONSES.has(value) || REAL_RESPONSES.has(respCn(value))
+}
+
+function itemFinished(item) {
+  if (!item) return false
+  return Boolean(item.is_finished ?? item.isFinished)
+}
+
+function itemIsNew(item) {
+  if (!item) return false
+  return Boolean(item.is_new ?? item.isNew)
 }
 
 function escapeCsv(value) {
@@ -235,11 +260,11 @@ function getSnapshotByName(name) {
 }
 
 function todayItemKey(item) {
-  return item?.voc_id || item?.vocId || ''
+  return String(item?.voc_id || item?.vocId || '').trim()
 }
 
 function wordText(item) {
-  return item?.voc_spelling || item?.word || ''
+  return item?.voc_spelling || item?.word || item?.spelling || item?.vocId || item?.voc_id || ''
 }
 
 function numberOrNull(value) {
@@ -292,76 +317,6 @@ function previousNextReviewDate(item) {
   return item?.previous_next_study_date || item?.previousNextStudyDate || ''
 }
 
-function normalizeWordKey(value) {
-  return String(value || '').trim().toLowerCase()
-}
-
-function predictionMemoryRowsForCurrentDate() {
-  const targetDate = workspace.value?.date || date.value || ''
-  const rows = Array.isArray(dataStore.rawRows) ? dataStore.rawRows : []
-  const row = rows.find(item => item?.date === targetDate) || rows[rows.length - 1] || null
-  if (!row) return []
-  const buckets = [
-    row.memoryReviewSpanItems,
-    row.memoryNextDueItems,
-    row.memoryReviewOutcomeItems,
-    row.memoryDiffItems,
-    row.summary?.memoryReviewSpanItems,
-    row.summary?.memoryNextDueItems,
-    row.summary?.memoryReviewOutcomeItems,
-    row.summary?.memoryDiffItems,
-  ]
-  const out = []
-  for (const bucket of buckets) {
-    if (Array.isArray(bucket)) out.push(...bucket)
-  }
-  return out
-}
-
-function buildPredictionMemoryIndex() {
-  const byId = new Map()
-  const byWord = new Map()
-  for (const raw of predictionMemoryRowsForCurrentDate()) {
-    if (!raw || typeof raw !== 'object') continue
-    const vid = String(raw.vocId || raw.voc_id || '').trim()
-    const word = normalizeWordKey(raw.word || raw.voc_spelling || raw.spelling)
-    if (vid && !byId.has(vid)) byId.set(vid, raw)
-    if (word && !byWord.has(word)) byWord.set(word, raw)
-  }
-  return { byId, byWord }
-}
-
-function mergePredictionMemory(item, memoryIndex) {
-  if (!item) return item
-  const vid = String(item.voc_id || item.vocId || '').trim()
-  const word = normalizeWordKey(item.voc_spelling || item.word || item.spelling)
-  const raw = (vid && memoryIndex.byId.get(vid)) || (word && memoryIndex.byWord.get(word)) || null
-  if (!raw) return item
-  const days = raw.days ?? raw.reviewSpanDays ?? raw.review_span_days ?? raw.memory_durability_days
-  return {
-    ...item,
-    study_count: item.study_count ?? item.studyCount ?? raw.studyCount ?? raw.study_count,
-    studyCount: item.studyCount ?? item.study_count ?? raw.studyCount ?? raw.study_count,
-    last_study_date: item.last_study_date || item.lastStudyDate || raw.lastStudyDate || raw.last_study_date || '',
-    lastStudyDate: item.lastStudyDate || item.last_study_date || raw.lastStudyDate || raw.last_study_date || '',
-    next_study_date: item.next_study_date || item.nextStudyDate || raw.nextStudyDate || raw.next_study_date || '',
-    nextStudyDate: item.nextStudyDate || item.next_study_date || raw.nextStudyDate || raw.next_study_date || '',
-    memory_durability_days: item.memory_durability_days ?? item.review_span_days ?? item.days ?? days,
-    review_span_days: item.review_span_days ?? item.memory_durability_days ?? item.days ?? days,
-    days: item.days ?? item.memory_durability_days ?? item.review_span_days ?? days,
-    prediction_raw_memory: item.prediction_raw_memory || raw,
-  }
-}
-
-function displayMemoryValue(item) {
-  return formatDays(memoryDurabilityDays(item))
-}
-
-function displayStudyCountValue(item) {
-  const value = studyCountValue(item)
-  return value === null ? '' : formatDays(value)
-}
-
 function createInitialCompareItem(source) {
   const item = source || {}
   const previousMemory = previousMemoryDurabilityDays(item)
@@ -407,9 +362,9 @@ function simplifyTodayItem(item) {
   return {
     单词: wordText(item),
     学习顺序: item?.order ?? '',
-    首次反应: respCn(item?.first_response),
-    是否新词: item?.is_new ? '是' : '否',
-    是否完成: item?.is_finished ? '是' : '否',
+    首次反应: respCn(rawResponse(item)),
+    是否新词: itemIsNew(item) ? '是' : '否',
+    是否完成: itemFinished(item) ? '是' : '否',
     学习次数: studyCountValue(item) ?? '',
     '记忆持久度(天)': formatDays(memoryDurabilityDays(item)),
     最近复习日期: lastReviewDate(item),
@@ -420,9 +375,9 @@ function simplifyTodayItem(item) {
 function simplifyCompareItem(item) {
   return {
     单词: wordText(item),
-    首次反应: respCn(item?.first_response),
-    是否新词: item?.is_new ? '是' : '否',
-    是否完成: item?.is_finished ? '是' : '否',
+    首次反应: respCn(rawResponse(item)),
+    是否新词: itemIsNew(item) ? '是' : '否',
+    是否完成: itemFinished(item) ? '是' : '否',
     学习次数: studyCountValue(item) ?? '',
     '记忆持久度(天)': formatDays(memoryDurabilityDays(item)),
     最近复习日期: lastReviewDate(item),
@@ -434,13 +389,6 @@ function changeText(beforeValue, afterValue) {
   const beforeText = beforeValue === undefined || beforeValue === null || beforeValue === '' ? '空' : String(beforeValue)
   const afterText = afterValue === undefined || afterValue === null || afterValue === '' ? '空' : String(afterValue)
   return beforeText === afterText ? '' : `${beforeText} -> ${afterText}`
-}
-
-function changeTextWithDelta(beforeValue, afterValue, formatter = value => value) {
-  const beforeNumber = numberOrNull(beforeValue)
-  const afterNumber = numberOrNull(afterValue)
-  if (beforeNumber === null || afterNumber === null || Math.abs(afterNumber - beforeNumber) < 0.05) return ''
-  return `${formatter(beforeNumber)} -> ${formatter(afterNumber)} (${formatSignedDays(afterNumber - beforeNumber)})`
 }
 
 function countChangeText(beforeValue, afterValue) {
@@ -467,6 +415,35 @@ function memoryChangeText(beforeValue, afterValue) {
     return `${beforeText} -> ${afterText} (${formatSignedDays(afterNumber - beforeNumber)})`
   }
   return `${beforeText} -> ${afterText}`
+}
+
+function actualReviewHappenedBetween(beforeItem, afterItem) {
+  if (!afterItem) return false
+  const beforeFinished = itemFinished(beforeItem)
+  const afterFinished = itemFinished(afterItem)
+  if (!beforeFinished && afterFinished) return true
+
+  const beforeResponse = normalizedResponse(beforeItem)
+  const afterResponse = normalizedResponse(afterItem)
+  if (hasRealResponse(afterItem) && beforeResponse !== afterResponse) return true
+
+  // last_study_date 只能作为辅助证据。没有完成状态或首次反应变化时，
+  // 不用 study_count / 记忆持久度单独判定复习，避免把历史基线差异误报为“今日复习”。
+  const beforeLast = lastReviewDate(beforeItem)
+  const afterLast = lastReviewDate(afterItem)
+  const workspaceDate = workspace.value?.date || date.value || ''
+  if (afterFinished && afterLast && afterLast !== beforeLast && (!workspaceDate || afterLast.slice(0, 10) === workspaceDate)) return true
+
+  return false
+}
+
+function longTermChanged(beforeItem, afterItem) {
+  return Boolean(
+    memoryChangeText(memoryDurabilityDays(beforeItem), memoryDurabilityDays(afterItem))
+      || countChangeText(studyCountValue(beforeItem), studyCountValue(afterItem))
+      || changeText(lastReviewDate(beforeItem), lastReviewDate(afterItem))
+      || changeText(nextReviewDate(beforeItem), nextReviewDate(afterItem))
+  )
 }
 
 function progressCsvFromSnapshot(name) {
@@ -547,22 +524,20 @@ function compareSnapshots(showAlert = true) {
 
   const aProg = a.progress || {}
   const bProg = b.progress || {}
-  // 时间点对比必须使用当前 snapshot 自身的 allItems。
-  // 这些字段已经由后端按 FSRS 输入历史注入，不能再用整天 rawRows 覆盖，
-  // 否则早晚时间点都会被当天最新预测数据污染。
   const aItems = Array.isArray(a.allItems) ? a.allItems : []
   const bItems = Array.isArray(b.allItems) ? b.allItems : []
   const usingInitialA = compareA.value === INITIAL_SNAPSHOT_NAME
-  const bMap = new Map(bItems.map(item => [todayItemKey(item), item]))
+  const bMap = new Map(bItems.map(item => [todayItemKey(item), item]).filter(([key]) => key))
   const aMap = usingInitialA
-    ? new Map(bItems.map(item => [todayItemKey(item), createInitialCompareItem(item)]))
-    : new Map(aItems.map(item => [todayItemKey(item), item]))
+    ? new Map(bItems.map(item => [todayItemKey(item), createInitialCompareItem(item)]).filter(([key]) => key))
+    : new Map(aItems.map(item => [todayItemKey(item), item]).filter(([key]) => key))
   const aKeys = new Set(aMap.keys())
   const bKeys = new Set(bMap.keys())
   const allKeys = new Set([...aKeys, ...bKeys])
   const added = []
   const removed = []
   const changedRows = []
+  let ignoredLongTermChangeCount = 0
 
   for (const key of bKeys) if (!aKeys.has(key)) added.push(simplifyCompareItem(bMap.get(key)))
   for (const key of aKeys) if (!bKeys.has(key)) removed.push(simplifyCompareItem(aMap.get(key)))
@@ -570,45 +545,57 @@ function compareSnapshots(showAlert = true) {
   for (const key of allKeys) {
     const x = aMap.get(key) || null
     const y = bMap.get(key) || null
+    const reviewedHere = actualReviewHappenedBetween(x, y)
     const row = {
       单词: wordText(y) || wordText(x),
     }
 
     if (compareOptions.statusChanged) {
-      const beforeStatus = x ? (x?.is_finished ? '是' : '否') : '无数据'
-      const afterStatus = y ? (y?.is_finished ? '是' : '否') : '无数据'
+      const beforeStatus = x ? (itemFinished(x) ? '是' : '否') : '无数据'
+      const afterStatus = y ? (itemFinished(y) ? '是' : '否') : '无数据'
       row.完成状态 = beforeStatus === afterStatus ? '' : `${beforeStatus} -> ${afterStatus}`
     }
 
     if (compareOptions.responseChanged) {
-      row.首次反应 = changeText(respCn(x?.first_response ?? x?.firstResponse), respCn(y?.first_response ?? y?.firstResponse))
+      row.首次反应 = changeText(normalizedResponse(x), normalizedResponse(y))
     }
 
     const previousDurability = usingInitialA ? previousMemoryDurabilityDays(y) : memoryDurabilityDays(x)
     const currentDurability = memoryDurabilityDays(y)
-    if (compareOptions.memoryChanged) {
+    const previousCount = usingInitialA ? previousStudyCountValue(y) : studyCountValue(x)
+    const currentCount = studyCountValue(y)
+    const previousLastDate = usingInitialA ? previousLastReviewDate(y) : lastReviewDate(x)
+    const currentLastDate = lastReviewDate(y)
+    const previousNextDate = usingInitialA ? previousNextReviewDate(y) : nextReviewDate(x)
+    const currentNextDate = nextReviewDate(y)
+
+    const hasSuppressedLongTermChange = !reviewedHere && longTermChanged(
+      {
+        memory_durability_days: previousDurability,
+        study_count: previousCount,
+        last_study_date: previousLastDate,
+        next_study_date: previousNextDate,
+      },
+      {
+        memory_durability_days: currentDurability,
+        study_count: currentCount,
+        last_study_date: currentLastDate,
+        next_study_date: currentNextDate,
+      }
+    )
+    if (hasSuppressedLongTermChange) ignoredLongTermChangeCount += 1
+
+    if (compareOptions.memoryChanged && reviewedHere) {
       row['记忆持久度(天)'] = memoryChangeText(previousDurability, currentDurability)
     }
 
-    const previousCount = usingInitialA ? previousStudyCountValue(y) : studyCountValue(x)
-    const currentCount = studyCountValue(y)
-    const studyCountChange = countChangeText(previousCount, currentCount)
-    if (compareOptions.studyCountChanged) {
-      row.学习次数 = studyCountChange
+    if (compareOptions.studyCountChanged && reviewedHere) {
+      row.学习次数 = countChangeText(previousCount, currentCount)
     }
 
-    const previousLastDate = usingInitialA ? previousLastReviewDate(y) : lastReviewDate(x)
-    const currentLastDate = lastReviewDate(y)
-    const lastStudyChange = changeText(previousLastDate, currentLastDate)
-    if (compareOptions.studyTimeChanged) {
-      row.最近复习日期 = lastStudyChange
-    }
-
-    const previousNextDate = usingInitialA ? previousNextReviewDate(y) : nextReviewDate(x)
-    const currentNextDate = nextReviewDate(y)
-    const nextStudyChange = changeText(previousNextDate, currentNextDate)
-    if (compareOptions.studyTimeChanged) {
-      row.下次复习日期 = nextStudyChange
+    if (compareOptions.studyTimeChanged && reviewedHere) {
+      row.最近复习日期 = changeText(previousLastDate, currentLastDate)
+      row.下次复习日期 = changeText(previousNextDate, currentNextDate)
     }
 
     const hasVisibleChange = Object.keys(row).some(keyName => keyName !== '单词' && row[keyName])
@@ -638,6 +625,9 @@ function compareSnapshots(showAlert = true) {
   appendWordListBlock(lines, '消失条目', removed, compareOptions.removed)
   const showChangeTable = compareOptions.statusChanged || compareOptions.responseChanged || compareOptions.memoryChanged || compareOptions.studyCountChanged || compareOptions.studyTimeChanged
   appendCsvBlock(lines, '单词变化', changedRows, showChangeTable, changeTableHeaders())
+  if (ignoredLongTermChangeCount > 0) {
+    lines.push('', `已忽略 ${ignoredLongTermChangeCount} 条“无本次复习证据但长期记忆字段不同”的变化，避免把历史基线差异误报为今日复习。`)
+  }
 
   compareOutput.value = lines.join('\n')
   saveCopyState()

@@ -77,9 +77,6 @@ function normalizeStudyStatus(day, row) {
   row.unfinishedCount = asNumber(pick(today.unfinished, row.unfinishedCount), Math.max(row.total - row.finished, 0))
   row.criticalDueToday = asNumber(critical.dueToday)
   row.criticalDueByOffset = critical.dueByOffset || {}
-  row.memoryNextDueItems = Array.isArray(critical.memoryNextDueItems)
-    ? critical.memoryNextDueItems
-    : (Array.isArray(summary.memoryNextDueItems) ? summary.memoryNextDueItems : (row.memoryNextDueItems || []))
 }
 
 export const useDataStore = defineStore('data', () => {
@@ -162,9 +159,17 @@ export const useDataStore = defineStore('data', () => {
     computeDisplayRows()
   }
 
+  function setAlerts(value) {
+    alerts.value = Array.isArray(value) ? value : []
+  }
+
+  function setTodayWorkspace(value) {
+    todayWorkspace.value = value || { date: '', snapshots: [], allProgressText: '', error: '' }
+  }
+
   return {
     rawRows, displayRows, todayWorkspace, alerts, renderMeta,
     wordList, loaded,
-    setDashboardData, refreshDisplayRows,
+    setDashboardData, refreshDisplayRows, setAlerts, setTodayWorkspace,
   }
 })

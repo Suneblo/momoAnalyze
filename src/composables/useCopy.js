@@ -142,17 +142,12 @@ function countDueOffset(row, offset) {
   const critical = getCriticalSource(row)
   const dueByOffset = critical.dueByOffset || row?.criticalDueByOffset || {}
   const direct = dueByOffset[String(offset)]
-  if (direct !== undefined && direct !== null) return toNumber(direct)
-
-  const items = Array.isArray(row?.memoryNextDueItems) ? row.memoryNextDueItems : []
-  return items.filter(item => Math.round(toNumber(item.days, NaN)) === offset).length
+  return direct !== undefined && direct !== null ? toNumber(direct) : 0
 }
 
 function countDueToday(row) {
   const critical = getCriticalSource(row)
-  if (critical.dueToday !== undefined && critical.dueToday !== null) return toNumber(critical.dueToday)
-  const items = Array.isArray(row?.memoryNextDueItems) ? row.memoryNextDueItems : []
-  return items.filter(item => Number(item.days) <= 0).length
+  return critical.dueToday !== undefined && critical.dueToday !== null ? toNumber(critical.dueToday) : 0
 }
 
 function getSnapshotSummaryValue(snapshot, key, fallback = '-') {
