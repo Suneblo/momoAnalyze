@@ -50,14 +50,16 @@
 </template>
 
 <script setup>
-import { computed, ref, onMounted, onBeforeUnmount, provide } from 'vue'
-import { ElMessageBox } from 'element-plus'
+import { computed, ref, onMounted, onBeforeUnmount, provide, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useSettingsStore } from './stores/settingsStore'
 import { useCardStore, PAGE_REGISTRY } from './stores/cardStore'
 import { useDataStore } from './stores/dataStore'
 import { usePredictionStore } from './stores/predictionStore'
 import { useApi } from './composables/useApi'
 import { buildAllMarkdown, copyToClipboard } from './composables/useCopy'
+import { buildPredictionOptions, hasPredictionRows, hasProbabilityModel } from './utils/predictionOptions'
+import { requestScrollLatestTables } from './utils/scrollLatest'
 import HeaderCard from './components/layout/HeaderCard.vue'
 import LogCard from './components/layout/LogCard.vue'
 import CardGrid from './components/layout/CardGrid.vue'
@@ -73,6 +75,7 @@ const pages = PAGE_REGISTRY
 const activePage = ref('today')
 const isUpdating = ref(false)
 const isReloading = ref(false)
+const isCopyingAll = ref(false)
 const isCopyingLatestDiff = ref(false)
 const ZOOM_STORAGE_KEY = 'momo-global-zoom'
 const FLOATING_PANEL_STORAGE_KEY = 'momo-floating-panel-positions'
@@ -87,6 +90,8 @@ function log(msg) {
   logRef.value?.log(msg)
 }
 provide('log', log)
+
+watch(activePage, () => requestScrollLatestTables())
 
 function clampZoom(value) {
   const numeric = Number(value)
@@ -292,16 +297,155 @@ async function reloadData(options = {}) {
     }
   } finally {
     isReloading.value = false
+    requestScrollLatestTables()
   }
 }
 
-async function copyAll() {
-  const md = buildAllMarkdown()
-  await copyToClipboard(md, '已复制全部选中内容')
-  log('已复制全部选中内容')
+const DASHBOARD_COPY_KEYS = new Set(['overviewChart', 'summary', 'memory', 'studyTime'])
+const WORKSPACE_COPY_KEYS = new Set(['todayWordStats', 'todayWorkspace'])
+const TIMEPOINT_DIFF_COPY_KEYS = new Set(['overviewChart', 'todayWordStats', 'todayWorkspace', 'summary', 'memory', 'studyTime'])
+
+function detailEnabled(cardId, detailKey) {
+  const state = cardStore.copyDetail?.[cardId]
+  if (!state || !Object.prototype.hasOwnProperty.call(state, detailKey)) return true
+  return state[detailKey] !== false
 }
 
-const TIMEPOINT_DIFF_COPY_KEYS = new Set(['overviewChart', 'todayWordStats', 'todayWorkspace', 'summary', 'memory', 'studyTime'])
+function anyDetailEnabled(cardId, detailKeys) {
+  return detailKeys.some(key => detailEnabled(cardId, key))
+}
+
+function copyNeedsDashboard(copyKeys) {
+  if (!copyKeys.some(key => DASHBOARD_COPY_KEYS.has(key))) return false
+  return (
+    (copyKeys.includes('overviewChart') && anyDetailEnabled('复习情况', ['status', 'today', 'critical'])) ||
+    (copyKeys.includes('summary') && detailEnabled('按日期统计表', 'table')) ||
+    (copyKeys.includes('memory') && detailEnabled('记忆持久度统计', 'chart')) ||
+    (copyKeys.includes('studyTime') && anyDetailEnabled('每日学习时长统计', ['chart', 'summary']))
+  )
+}
+
+function copyNeedsWorkspace(copyKeys) {
+  if (!copyKeys.some(key => WORKSPACE_COPY_KEYS.has(key))) return false
+  return (
+    (copyKeys.includes('todayWordStats') && detailEnabled('当日单词统计', 'snapshots')) ||
+    (copyKeys.includes('todayWorkspace') && anyDetailEnabled('当日时间点查看', ['summary', 'latest', 'compare']))
+  )
+}
+
+function copyNeedsPredictionRows(copyKeys) {
+  return (
+    (copyKeys.includes('prediction') && anyDetailEnabled('未来每日学习量预测', ['forecast', 'table'])) ||
+    (copyKeys.includes('predictionTarget') && detailEnabled('目标达标与复习概率', 'chart'))
+  )
+}
+
+function copyNeedsProbabilityModel(copyKeys) {
+  return copyKeys.includes('predictionTarget') && detailEnabled('目标达标与复习概率', 'probability')
+}
+
+function dashboardLoaded() {
+  return Array.isArray(dataStore.rawRows) && dataStore.rawRows.length > 0
+}
+
+function workspaceLoaded() {
+  const workspace = dataStore.todayWorkspace || {}
+  return Boolean(workspace.date || workspace.error || (workspace.snapshots || []).length)
+}
+
+function missingCopyData(copyKeys) {
+  const missing = []
+  if (copyNeedsDashboard(copyKeys) && !dashboardLoaded()) missing.push('历史统计数据')
+  if (copyNeedsWorkspace(copyKeys) && !workspaceLoaded()) missing.push('当日时间点数据')
+  if (copyNeedsPredictionRows(copyKeys) && !hasPredictionRows(prediction.result)) missing.push('未来每日学习量预测')
+  if (copyNeedsProbabilityModel(copyKeys) && !hasProbabilityModel(prediction.result)) missing.push('复习概率分桶')
+  return [...new Set(missing)]
+}
+
+async function runPredictionForCopy() {
+  const total = Number(settings.predictionDays) || 30
+  prediction.isCalculating = true
+  prediction.progress = { current: 0, total }
+  settings.save()
+  log('复制前正在计算预测和概率模型...')
+  try {
+    const data = await api.fetchFsrsPrediction(buildPredictionOptions(settings))
+    if (!data?.success) throw new Error(data?.error || data?.result?.message || '后端 FSRS 预测失败')
+    prediction.result = data.result
+    prediction.saveCache()
+    requestScrollLatestTables()
+    log(hasPredictionRows(prediction.result) ? '复制前预测已补齐' : `预测计算完成但无结果：${prediction.result?.message || '无结果'}`)
+  } finally {
+    prediction.progress = { current: total, total }
+    prediction.isCalculating = false
+  }
+}
+
+async function ensureDataForCopy(actionName, copyKeys) {
+  const initialMissing = missingCopyData(copyKeys)
+  if (!initialMissing.length) return true
+
+  const needsReload = (
+    (copyNeedsDashboard(copyKeys) && !dashboardLoaded()) ||
+    (copyNeedsWorkspace(copyKeys) && !workspaceLoaded())
+  )
+  const needsPrediction = (
+    (copyNeedsPredictionRows(copyKeys) && !hasPredictionRows(prediction.result)) ||
+    (copyNeedsProbabilityModel(copyKeys) && !hasProbabilityModel(prediction.result))
+  )
+  const actions = [
+    needsReload ? '重新加载页面数据' : '',
+    needsPrediction ? '计算预测和概率模型' : '',
+  ].filter(Boolean)
+
+  try {
+    await ElMessageBox.confirm(
+      `${actionName}需要先补齐：${initialMissing.join('、')}。\n确认后将自动${actions.join('、')}，完成后继续复制。`,
+      '复制前需要加载数据',
+      {
+        confirmButtonText: '一键加载并复制',
+        cancelButtonText: '取消',
+        type: 'warning',
+      },
+    )
+  } catch {
+    log(`${actionName}已取消：数据未补齐`)
+    return false
+  }
+
+  if (needsReload) {
+    log(`${actionName}：正在重新加载页面数据...`)
+    await reloadData({ promptTodayEmpty: false })
+  }
+  if (needsPrediction) {
+    await runPredictionForCopy()
+  }
+
+  const stillMissing = missingCopyData(copyKeys)
+  if (stillMissing.length) {
+    const message = `${actionName}仍缺少：${stillMissing.join('、')}`
+    ElMessage.warning(message)
+    log(message)
+    return false
+  }
+  return true
+}
+
+async function copyAll() {
+  if (isCopyingAll.value) return
+  const copyKeys = cardStore.getCopyKeys()
+  isCopyingAll.value = true
+  try {
+    if (!(await ensureDataForCopy('复制全部选中内容', copyKeys))) return
+    const md = buildAllMarkdown()
+    await copyToClipboard(md, '已复制全部选中内容')
+    log('已复制全部选中内容')
+  } catch (e) {
+    log('复制全部选中内容失败：' + (e.message || e))
+  } finally {
+    isCopyingAll.value = false
+  }
+}
 
 function timepointCopyDetails() {
   return {
@@ -321,6 +465,7 @@ async function copyLatestTimepointDiff() {
     log('最近时间点变化复制失败：总复制里没有勾选可对比时间点变化的卡片')
     return
   }
+  if (!(await ensureDataForCopy('最近时间点变化复制', copyKeys))) return
   isCopyingLatestDiff.value = true
   log('正在生成最近时间点变化...')
   try {

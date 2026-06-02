@@ -32,7 +32,7 @@ export const CARD_REGISTRY = [
   { id: '按日期统计表', page: 'study', copyKey: 'summary', copyDetail: { table: '表格数据' } },
   { id: '字段注释', page: 'study', copyKey: 'notes', copyDetail: { notes: '字段说明' } },
 
-  { id: '未来每日学习量预测', page: 'tools', copyKey: 'prediction', copyDetail: { table: '预测表格', probability: '概率分桶', forecast: '预测数据' } },
+  { id: '未来每日学习量预测', page: 'tools', copyKey: 'prediction', copyDetail: { table: '预测表格', forecast: '预测数据' } },
   { id: '目标达标与复习概率', page: 'tools', copyKey: 'predictionTarget', copyDetail: { chart: '图表', probability: '概率分桶' } },
   { id: '查看单词列表', page: 'tools', copyKey: 'wordList', copyDetail: { list: '单词列表' } },
   { id: '云词本管理器', page: 'tools', copyKey: 'notepadManager', copyEnabled: false },

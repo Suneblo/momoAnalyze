@@ -39,7 +39,7 @@
         <h3>快照实时数据</h3>
         <span class="info-text">包含认识、模糊、忘记、临界、未完成等实时字段。</span>
       </div>
-      <div class="table-wrapper stat-table-scroll snapshot-table-wrap">
+      <div class="table-wrapper stat-table-scroll snapshot-table-wrap" data-latest-scroll>
         <table class="mini-table snapshot-table">
           <thead>
             <tr>
@@ -110,6 +110,7 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { useDataStore } from '@/stores/dataStore'
 import { useApi } from '@/composables/useApi'
+import { requestScrollLatestTables } from '@/utils/scrollLatest'
 import BaseChart from '@/components/charts/BaseChart.vue'
 
 defineProps({ card: Object })
@@ -424,6 +425,7 @@ async function loadDate() {
     } else {
       dataStore.setTodayWorkspace({ date: selectedDate.value, snapshots: [], allProgressText: '', error: '该日期暂无快照数据' })
     }
+    requestScrollLatestTables()
   } finally {
     loading.value = false
   }

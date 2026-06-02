@@ -1,6 +1,6 @@
 <template>
   <div>
-    <p class="info-text">柱高表示预测总量；绿色为新学，黄色为复习。概率分桶默认按 n/忘/模/认/Easy 统计；新词模拟时默认先进入次日复习。</p>
+    <p class="info-text">柱高表示预测总量；绿色为新学，黄色为复习；新词模拟时默认先进入次日复习。</p>
 
     <div class="prediction-toolbar">
       <label>预测天数 <input v-model.number="settings.predictionDays" type="number" min="1" step="1"></label>
@@ -21,9 +21,6 @@
       </label>
       <label>新学/总量数值 <input v-model="settings.predictionDailyValue" type="number" min="0" step="1" placeholder="0"></label>
       <label>复习数量上限 <input v-model="settings.predictionReviewLimit" type="number" min="0" step="1" placeholder="不限制"></label>
-      <label class="switch-label"><input v-model="settings.predictionUseStudyCountDimension" type="checkbox" @change="settings.save()"> 使用学习次数维度</label>
-      <label>记忆每桶目标词数 <input v-model.number="settings.predictionProbMemoryBucketSize" type="number" min="1" step="1" @change="settings.save()"></label>
-      <label v-if="settings.predictionUseStudyCountDimension">学习次数桶宽 <input v-model.number="settings.predictionProbStudyCountBucketSize" type="number" min="1" step="1" @change="settings.save()"></label>
       <label>认识→
         <select v-model="settings.predictionRatingKnown" @change="settings.save()">
           <option value="good">Good/认识</option><option value="easy">Easy</option><option value="hard">Hard/模糊</option><option value="again">Again/忘记</option>
@@ -69,7 +66,7 @@
       </div>
     </div>
 
-    <div v-if="prediction.result?.rows?.length" class="stat-table-scroll">
+    <div v-if="prediction.result?.rows?.length" class="stat-table-scroll" data-latest-scroll>
       <el-table :data="prediction.result.rows" size="small" border stripe max-height="400" class="no-squeeze-table clickable-table" :fit="false" style="width:1030px" :row-style="{ cursor: 'pointer' }" @row-click="openDayDetailFromRow">
         <el-table-column prop="predictionDay" label="几天后" width="70" />
         <el-table-column prop="date" label="日期" width="110" />
@@ -151,6 +148,8 @@ import { ElMessage } from 'element-plus'
 import { useSettingsStore } from '@/stores/settingsStore'
 import { usePredictionStore } from '@/stores/predictionStore'
 import { buildBarOption, COLORS } from '@/utils/chartOptions'
+import { buildPredictionOptions } from '@/utils/predictionOptions'
+import { requestScrollLatestTables } from '@/utils/scrollLatest'
 import BaseChart from '@/components/charts/BaseChart.vue'
 import { useApi } from '@/composables/useApi'
 
@@ -202,31 +201,7 @@ const predChartOption = computed(() => {
 })
 
 function predictionOptions() {
-  return {
-    horizonDays: settings.predictionDays,
-    initMode: settings.predictionInitMode,
-    dailyMode: settings.predictionDailyMode,
-    dailyBaseValue: settings.predictionDailyValue,
-    reviewLimit: settings.predictionReviewLimit,
-    deferOverflow: settings.predictionDeferOverflow,
-    ratingMapping: {
-      known: settings.predictionRatingKnown,
-      vague: settings.predictionRatingVague,
-      forget: settings.predictionRatingForget,
-    },
-    targetSettings: {
-      metric: settings.predictionTargetMetric,
-      days: settings.predictionTargetDays,
-      count: settings.predictionTargetCount,
-    },
-    modelFrom: settings.predictionModelFrom,
-    modelTo: settings.predictionModelTo,
-    probabilitySettings: {
-      memoryBucketSize: settings.predictionProbMemoryBucketSize,
-      studyCountBucketSize: settings.predictionProbStudyCountBucketSize,
-      useStudyCountDimension: settings.predictionUseStudyCountDimension,
-    },
-  }
+  return buildPredictionOptions(settings)
 }
 
 async function runPrediction() {
@@ -246,6 +221,7 @@ async function runPrediction() {
       ElMessage.success('预测计算完成')
       log?.('预测计算完成')
     }
+    requestScrollLatestTables()
   } catch (error) {
     ElMessage.error(error.message || String(error))
     log?.(`预测计算失败：${error.message || error}`)

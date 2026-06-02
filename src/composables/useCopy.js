@@ -785,10 +785,6 @@ export function buildSingleCardMarkdown(copyKey) {
       parts.push('## 预测表格', buildPredictionMarkdown(result))
       selected += 1
     }
-    if (getCopyDetailEnabled(cardStore, '未来每日学习量预测', 'probability')) {
-      parts.push(buildProbabilityMarkdown(result?.probabilityModel))
-      selected += 1
-    }
     if (!selected) parts.push('_未勾选预测复制明细_')
   } else if (copyKey === 'predictionTarget') {
     parts.push(`# 目标达标与复习概率\n`)

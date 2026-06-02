@@ -10,7 +10,7 @@
       <span v-if="workspace.error" class="error-text">{{ workspace.error }}</span>
     </div>
 
-    <div class="table-wrapper stat-table-scroll">
+    <div class="table-wrapper stat-table-scroll" data-latest-scroll>
       <table class="mini-table">
         <thead>
           <tr>
@@ -107,6 +107,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import { useDataStore } from '@/stores/dataStore'
 import { useSettingsStore } from '@/stores/settingsStore'
 import { useApi } from '@/composables/useApi'
+import { requestScrollLatestTables } from '@/utils/scrollLatest'
 
 const COPY_STATE_KEY = 'momoTodayWorkspaceCopyState'
 const INITIAL_SNAPSHOT_NAME = '__INITIAL_ZERO__'
@@ -716,6 +717,7 @@ watch(snapshots, value => {
   if (!compareB.value || !value.some(item => item.name === compareB.value)) compareB.value = latest
   if (value.length >= 2 && compareA.value === compareB.value) compareA.value = previous || first || INITIAL_SNAPSHOT_NAME
   refreshSinglePreview()
+  requestScrollLatestTables()
 }, { immediate: true })
 
 watch([selectedSnapshotName, compareA, compareB], () => {

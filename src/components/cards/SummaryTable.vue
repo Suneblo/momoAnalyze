@@ -5,7 +5,7 @@
       <el-button size="small" @click="copySummary">复制表格</el-button>
     </div>
 
-    <div v-if="rows.length" class="stat-table-scroll">
+    <div v-if="rows.length" class="stat-table-scroll" data-latest-scroll>
       <el-table
         :data="rows"
         size="small"

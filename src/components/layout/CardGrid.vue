@@ -35,10 +35,6 @@
             <label>认识→<select v-model="settings.predictionRatingKnown" @change="settings.save()"><option value="good">Good</option><option value="easy">Easy</option><option value="hard">Hard</option><option value="again">Again</option></select></label>
             <label style="margin-left:8px">模糊→<select v-model="settings.predictionRatingVague" @change="settings.save()"><option value="hard">Hard</option><option value="good">Good</option><option value="again">Again</option></select></label>
             <label style="margin-left:8px">忘记→<select v-model="settings.predictionRatingForget" @change="settings.save()"><option value="again">Again</option><option value="hard">Hard</option><option value="good">Good</option></select></label>
-            <label style="margin-left:8px"><input v-model="settings.predictionUseStudyCountDimension" type="checkbox" @change="settings.save()"> 学习次数维度</label>
-            <div class="info-text" style="margin-top:6px">概率分桶设置</div>
-            <label>记忆每桶目标词数 <input v-model.number="settings.predictionProbMemoryBucketSize" type="number" min="1" step="1" style="width:76px" @change="settings.save()"></label>
-            <label style="margin-left:8px">次数桶宽 <input v-model.number="settings.predictionProbStudyCountBucketSize" type="number" min="1" step="1" style="width:70px" @change="settings.save()"></label>
           </div>
         </div>
       </div>

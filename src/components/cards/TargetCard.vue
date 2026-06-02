@@ -17,6 +17,12 @@
       复习概率模型：按全局历史中“记忆持久度 × 学习次数 → 再次复习首次反应”统计；记忆持久度按固定目标词数分桶，相同天数会整组保留在同一桶里，不会为了凑词数拆开。新词不参与复习概率分桶，模拟时默认进入次日复习。
     </p>
 
+    <div class="prediction-toolbar probability-model-toolbar">
+      <label class="switch-label"><input v-model="settings.predictionUseStudyCountDimension" type="checkbox" @change="settings.save()"> 使用学习次数维度</label>
+      <label>记忆每桶目标词数 <input v-model.number="settings.predictionProbMemoryBucketSize" type="number" min="1" step="1" @change="settings.save()"></label>
+      <label v-if="settings.predictionUseStudyCountDimension">学习次数桶宽 <input v-model.number="settings.predictionProbStudyCountBucketSize" type="number" min="1" step="1" @change="settings.save()"></label>
+    </div>
+
     <BaseChart v-if="probabilityChartOption" :option="probabilityChartOption" :height="300" />
 
     <div v-if="probability3dVisible" class="probability-3d-card">
@@ -160,6 +166,9 @@ function toggleProbability3dRating(key, checked) {
   align-items: center;
   gap: 10px 16px;
   margin-bottom: 14px;
+}
+.probability-model-toolbar {
+  margin-top: -4px;
 }
 .prediction-toolbar label {
   font-size: 13px;
