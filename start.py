@@ -2,7 +2,7 @@
 """MomoAnalyze only startup entry for Windows and Android/Termux.
 
 This single entrypoint starts the Python backend and the Vite frontend.
-Do not use separate .bat or .sh launchers; configuration is read from config/app.json.
+Do not use separate .bat or .sh launchers; configuration is read from app.json.
 
 Windows usage:
     python start.py
@@ -18,11 +18,13 @@ Android/Termux usage:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import platform
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -41,6 +43,7 @@ from momo_config import (  # noqa: E402
     backend_host as config_backend_host,
     backend_port as config_backend_port,
     database_path as config_database_path,
+    ensure_app_config,
     frontend_host as config_frontend_host,
     frontend_port as config_frontend_port,
 )
@@ -137,6 +140,8 @@ def health_json(port: int, path: str = "/api/health", timeout: float = 1.0) -> b
         with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout) as resp:
             body = resp.read().decode("utf-8", errors="replace")
         data = json.loads(body)
+        if path == "/api/health":
+            return bool(data.get("success")) and data.get("serviceKind") == "momo_sqlite_dashboard"
         return bool(data.get("success"))
     except Exception:
         return False
@@ -155,6 +160,27 @@ def health_http(port: int, host: str = "127.0.0.1", timeout: float = 1.0) -> boo
             return True
     except Exception:
         return False
+
+
+def can_bind(host: str, port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((probe_host(host) if host == "::" else host, int(port)))
+        return True
+    except OSError:
+        return False
+
+
+def find_bindable_port(host: str, preferred: int, *, label: str) -> int:
+    preferred = int(preferred)
+    if can_bind(host, preferred):
+        return preferred
+
+    for port in range(preferred + 1, preferred + 80):
+        if can_bind(host, port):
+            log(f"{label}端口 {preferred} 不可用，自动改用 {port}")
+            return port
+    raise RuntimeError(f"{label}端口 {preferred} 不可用，且没有找到可用备用端口")
 
 
 def wait_for_backend(proc: subprocess.Popen, port: int, log_path: Path) -> bool:
@@ -229,14 +255,14 @@ def ensure_base_files(db_path: Path) -> None:
     service_py = ROOT / "py" / "momo_service.py"
     if not service_py.exists():
         raise FileNotFoundError(f"后端入口不存在: {service_py}")
-    if not db_path.exists():
-        raise FileNotFoundError(
-            "数据库不存在: "
-            f"{db_path}\n"
-            "默认路径是 data/momo.sqlite；请先迁移/生成数据库，或用 --db 指定路径。"
-        )
     if not (ROOT / "package.json").exists():
         raise FileNotFoundError(f"package.json 不存在: {ROOT / 'package.json'}")
+    if not db_path.exists():
+        log(f"数据库不存在，将自动创建: {db_path}")
+    from momo_db import db_connect, setup_schema
+
+    with db_connect(db_path) as conn:
+        setup_schema(conn)
 
 
 def ensure_common_commands() -> None:
@@ -278,16 +304,61 @@ def fix_frontend_dependencies() -> None:
     log("前端依赖修复完成。")
 
 
-def ensure_project_node_modules(install: bool) -> None:
+def ensure_project_node_modules(auto_install: bool) -> None:
     if (ROOT / "node_modules" / "vite").exists():
         return
-    if install:
+    if auto_install:
+        log("前端依赖缺失，将自动安装: npm install")
         npm_install_project()
         return
     raise RuntimeError(
         "未找到 node_modules/vite。请先运行: npm install\n"
-        "也可以直接运行: python start.py --install"
+        "也可以直接运行: python start.py"
     )
+
+
+def requirement_import_name(requirement: str) -> str:
+    text = requirement.strip()
+    for sep in (";", "[", "<", ">", "=", "~", "!"):
+        if sep in text:
+            text = text.split(sep, 1)[0]
+    return text.strip().replace("-", "_")
+
+
+def missing_python_requirements() -> list[str]:
+    requirements = ROOT / "requirements.txt"
+    if not requirements.exists():
+        return []
+
+    missing: list[str] = []
+    for raw in requirements.read_text(encoding="utf-8").splitlines():
+        text = raw.strip()
+        if not text or text.startswith("#") or text.startswith("-"):
+            continue
+        module_name = requirement_import_name(text)
+        if module_name and importlib.util.find_spec(module_name) is None:
+            missing.append(text)
+    return missing
+
+
+def ensure_python_requirements(auto_install: bool) -> None:
+    missing = missing_python_requirements()
+    if not missing:
+        return
+    if not auto_install:
+        raise RuntimeError(
+            "Python 依赖缺失: "
+            + ", ".join(missing)
+            + "\n请运行: "
+            + quote_cmd([sys.executable, "-m", "pip", "install", "-r", str(ROOT / "requirements.txt")])
+        )
+
+    log("Python 依赖缺失，将自动安装: " + ", ".join(missing))
+    run_checked([sys.executable, "-m", "pip", "install", "-r", str(ROOT / "requirements.txt")], cwd=ROOT)
+
+    still_missing = missing_python_requirements()
+    if still_missing:
+        raise RuntimeError("Python 依赖安装后仍缺失: " + ", ".join(still_missing))
 
 
 def copy_tree_clean(src: Path, dst: Path) -> None:
@@ -314,11 +385,9 @@ def sync_termux_frontend_app(runner: Path, args: argparse.Namespace) -> Path:
         if src.exists():
             shutil.copy2(src, app_dir / filename)
 
-    config_src = ROOT / "config" / "app.json"
+    config_src = ROOT / "app.json"
     if config_src.exists():
-        config_dst_dir = app_dir / "config"
-        config_dst_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(config_src, config_dst_dir / "app.json")
+        shutil.copy2(config_src, app_dir / "app.json")
 
     # Termux/Android 上 esbuild 加载复杂的临时配置文件时可能崩溃。
     # 这里生成普通 vite.config.js，并让 Vite 在 app_dir 下默认加载它。
@@ -360,7 +429,7 @@ export default defineConfig({{
 
     return app_dir
 
-def ensure_termux_runner(runner: Path, install: bool) -> None:
+def ensure_termux_runner(runner: Path, auto_install: bool) -> None:
     npm = npm_exe()
     if not npm:
         raise RuntimeError("未找到 npm")
@@ -372,8 +441,14 @@ def ensure_termux_runner(runner: Path, install: bool) -> None:
 
     missing = [pkg for pkg in TERMUX_RUNNER_PACKAGES if not (runner / "node_modules" / pkg).exists()]
     if missing:
-        if not install:
-            log("Termux runner 依赖缺失，将自动安装: " + ", ".join(missing))
+        if not auto_install:
+            raise RuntimeError(
+                "Termux runner 依赖缺失: "
+                + ", ".join(missing)
+                + "\n请运行: "
+                + quote_cmd([npm, "install", *TERMUX_RUNNER_INSTALL])
+            )
+        log("Termux runner 依赖缺失，将自动安装: " + ", ".join(missing))
         run_checked([npm, "install", *TERMUX_RUNNER_INSTALL], cwd=runner)
 
     vite_bin = runner / "node_modules" / "vite" / "bin" / "vite.js"
@@ -429,6 +504,7 @@ def frontend_command(args: argparse.Namespace, termux: bool, runner: Path | None
             args.frontend_host,
             "--port",
             str(args.frontend_port),
+            "--strictPort",
             "--clearScreen",
             "false",
         ]
@@ -446,6 +522,7 @@ def frontend_command(args: argparse.Namespace, termux: bool, runner: Path | None
         args.frontend_host,
         "--port",
         str(args.frontend_port),
+        "--strictPort",
     ]
 
 
@@ -628,14 +705,15 @@ def parse_args() -> argparse.Namespace:
     db_default = str(config_database_path(ROOT))
 
     parser = argparse.ArgumentParser(description="MomoAnalyze 统一启动器：Windows 和 Termux 共用。")
-    parser.add_argument("--db", default=os.environ.get("DB", db_default), help="SQLite 数据库路径，默认读取 config/app.json")
+    parser.add_argument("--db", default=os.environ.get("DB", db_default), help="SQLite 数据库路径，默认读取 app.json")
     parser.add_argument("--backend-host", default=os.environ.get("BACKEND_HOST", backend_host_default))
     parser.add_argument("--backend-port", type=int, default=int(os.environ.get("BACKEND_PORT", backend_port_default)))
     parser.add_argument("--frontend-host", default=os.environ.get("FRONTEND_HOST", frontend_host_default))
     parser.add_argument("--frontend-port", type=int, default=int(os.environ.get("FRONTEND_PORT", frontend_port_default)))
     parser.add_argument("--runner", default=os.environ.get("RUNNER"), help="Termux Vite runner 目录，默认 ~/momo-vite-runner")
     parser.add_argument("--session", default=os.environ.get("SESSION", "momo"), help="Termux tmux 会话名")
-    parser.add_argument("--install", action="store_true", help="缺少前端依赖时自动安装")
+    parser.add_argument("--install", action="store_true", help="兼容旧参数；当前默认会自动安装缺失依赖")
+    parser.add_argument("--no-install", action="store_true", help="缺少依赖时只报错，不自动安装")
     parser.add_argument("--fix-frontend", action="store_true", help="重装前端依赖并固定到 Windows 稳定 Vite 5")
     parser.add_argument("--production", action="store_true", help="Windows/桌面端使用 npm run preview，而不是 npm run dev")
     parser.add_argument("--tmux", action="store_true", help="Termux 下使用 tmux 分屏启动")
@@ -644,10 +722,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    ensure_app_config(ROOT)
     args = parse_args()
     termux = is_termux()
     db_path = resolve_path(args.db, ROOT / "data" / "momo.sqlite")
     runner = Path(args.runner).expanduser().resolve() if args.runner else (Path.home() / "momo-vite-runner")
+    auto_install = not args.no_install
+
+    args.backend_port = find_bindable_port(args.backend_host, args.backend_port, label="后端")
+    args.frontend_port = find_bindable_port(args.frontend_host, args.frontend_port, label="前端")
 
     log("=" * 64)
     log("MomoAnalyze 统一启动器")
@@ -663,6 +746,7 @@ def main() -> int:
     try:
         ensure_base_files(db_path)
         ensure_common_commands()
+        ensure_python_requirements(auto_install)
 
         if args.fix_frontend:
             fix_frontend_dependencies()
@@ -670,14 +754,14 @@ def main() -> int:
                 log("修复完成。继续启动...")
 
         if termux:
-            ensure_termux_runner(runner, args.install)
+            ensure_termux_runner(runner, auto_install)
             termux_app = sync_termux_frontend_app(runner, args)
             log(f"Termux 前端运行副本: {termux_app}")
             if args.tmux:
                 return start_tmux(args, db_path, runner, termux_app)
             return start_plain(args, db_path, termux=True, runner=runner, termux_app=termux_app)
 
-        ensure_project_node_modules(args.install)
+        ensure_project_node_modules(auto_install)
         return start_plain(args, db_path, termux=False, runner=None)
     except KeyboardInterrupt:
         log("已取消。")

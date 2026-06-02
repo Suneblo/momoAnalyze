@@ -52,8 +52,7 @@ export const useSettingsStore = defineStore('settings', () => {
   const predictionModelFrom = ref('')
   const predictionModelTo = ref('')
   const predictionUseStudyCountDimension = ref(true)
-  const predictionProbLogBase = ref(2)
-  const predictionProbBucketSize = ref(1)
+  const predictionProbMemoryBucketSize = ref(10)
   const predictionProbStudyCountBucketSize = ref(5)
 
   function load() {
@@ -94,7 +93,7 @@ export const useSettingsStore = defineStore('settings', () => {
     predictionReviewLimit, predictionRatingKnown, predictionRatingVague, predictionRatingForget,
     predictionTargetMetric, predictionTargetDays, predictionTargetCount,
     predictionDeferOverflow, predictionModelFrom, predictionModelTo,
-    predictionUseStudyCountDimension, predictionProbLogBase, predictionProbBucketSize, predictionProbStudyCountBucketSize,
+    predictionUseStudyCountDimension, predictionProbMemoryBucketSize, predictionProbStudyCountBucketSize,
     moveReviewPlanStackItem,
     load, save
   }

@@ -75,7 +75,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useApi } from '@/composables/useApi'
 
 defineProps({ card: Object })
@@ -269,7 +269,6 @@ async function createAndWriteNotepad() {
   }
 }
 
-onMounted(loadNotepads)
 </script>
 
 <style scoped>

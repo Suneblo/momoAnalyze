@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """FSRS-based memory prediction helpers for the Maimemo dashboard.
 
-The dashboard keeps the Maimemo response -> FSRS rating mapping in config/app.json.
+The dashboard keeps the Maimemo response -> FSRS rating mapping in app.json.
 """
 
 from __future__ import annotations
@@ -455,7 +455,7 @@ def build_fsrs_dashboard_payload(conn: sqlite3.Connection, root_dir: Path | None
     except Exception as exc:
         return {"available": False, "enabled": False, "message": f"读取 FSRS 配置失败：{exc}", "config": {}}
     if not config.get("enabled", True):
-        return {"available": False, "enabled": False, "message": "config/app.json 已关闭 FSRS 预测。", "config": config}
+        return {"available": False, "enabled": False, "message": "app.json 已关闭 FSRS 预测。", "config": config}
 
     try:
         from fsrs import Card, Rating, Scheduler  # type: ignore
@@ -483,13 +483,16 @@ def build_fsrs_dashboard_payload(conn: sqlite3.Connection, root_dir: Path | None
         items: list[dict[str, Any]] = []
         prediction_cfg = config.get("prediction") if isinstance(config.get("prediction"), dict) else {}
         estimated_default_days = max(1.0, float(prediction_cfg.get("defaultDays") or 30))
-        for key, rec in current_records.items():
+        for card_id, (key, rec) in enumerate(current_records.items(), start=1):
             if len(items) >= max_rows:
                 break
             events = histories.get(key) or []
             study_count = _record_study_count(rec)
             quality = _history_quality(events, study_count, prediction_cfg)
-            card = Card()
+            # fsrs.Card() sleeps 1ms when card_id is omitted to avoid id collisions.
+            # The dashboard only needs an in-memory simulation card, so an explicit
+            # per-run id avoids that library-side delay for every word.
+            card = Card(card_id=card_id)
             for event in events:
                 rating_name = _response_to_rating_name(event.response, config)
                 rating = _rating_enum(Rating, rating_name)
@@ -640,20 +643,107 @@ def _frontend_add_days(date_text: str, days: int) -> str:
     return (base + timedelta(days=int(days or 0))).date().isoformat()
 
 
-def _frontend_bucket_memory(days: Any, settings: dict[str, Any]) -> dict[str, Any]:
+def _frontend_memory_day_value(days: Any) -> int:
     try:
-        value = max(1, round(float(days or 1)))
+        return max(1, round(float(days or 1)))
     except Exception:
-        value = 1
-    base = max(1.1, float(settings.get("logBase") or 2))
-    width = max(0.1, float(settings.get("bucketSize") or 1))
-    log_value = math.log(value) / math.log(base)
-    start_exp = math.floor(log_value / width) * width
-    end_exp = start_exp + width
-    lower = max(1, math.floor(base ** start_exp))
-    upper = max(lower, max(lower, math.ceil(base ** end_exp) - 1))
-    key = f"{lower}-{upper}"
-    return {"key": key, "label": f"{lower}天" if lower == upper else f"{lower}-{upper}天", "lower": lower, "upper": upper, "center": (lower + upper) / 2}
+        return 1
+
+
+def _frontend_memory_bucket_label(index: int, lower: int, upper: int) -> str:
+    if lower == upper:
+        return f"{lower}天"
+    return f"{lower}-{upper}天"
+
+
+def _frontend_build_fixed_count_memory_buckets(items: list[dict[str, Any]], settings: dict[str, Any]) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]]]:
+    target_size = max(1, round(float(settings.get("memoryBucketSize") or 10)))
+    samples: list[tuple[int, int]] = []
+    for idx, item in enumerate(items, start=1):
+        value = _frontend_memory_day_value(item.get("currentIntervalDays") or item.get("expectedNextIntervalDays") or 1)
+        samples.append((idx, value))
+
+    if not samples:
+        return {}, []
+
+    samples.sort(key=lambda row: (row[1], row[0]))
+    grouped: list[tuple[int, list[int]]] = []
+    for item_idx, value in samples:
+        if grouped and grouped[-1][0] == value:
+            grouped[-1][1].append(item_idx)
+        else:
+            grouped.append((value, [item_idx]))
+
+    assignment: dict[int, dict[str, Any]] = {}
+    buckets: list[dict[str, Any]] = []
+    bucket_groups: list[list[tuple[int, list[int]]]] = []
+    current_groups: list[tuple[int, list[int]]] = []
+    current_count = 0
+
+    for value, item_indexes in grouped:
+        current_groups.append((value, item_indexes))
+        current_count += len(item_indexes)
+        if current_count >= target_size:
+            bucket_groups.append(current_groups)
+            current_groups = []
+            current_count = 0
+
+    if current_groups:
+        if bucket_groups:
+            bucket_groups[-1].extend(current_groups)
+        else:
+            bucket_groups.append(current_groups)
+
+    def add_bucket(groups: list[tuple[int, list[int]]]) -> None:
+        if not groups:
+            return
+        bucket_index = len(buckets) + 1
+        values = [value for value, _ in groups]
+        lower = min(values)
+        upper = max(values)
+        item_indexes = [item_idx for _, indexes in groups for item_idx in indexes]
+        key = f"m{bucket_index}:{lower}-{upper}"
+        bucket = {
+            "key": key,
+            "label": _frontend_memory_bucket_label(bucket_index, lower, upper),
+            "lower": lower,
+            "upper": upper,
+            "center": (lower + upper) / 2,
+            "sort": bucket_index,
+            "sampleCount": len(item_indexes),
+            "targetSampleCount": target_size,
+            "bucketMode": "fixed_count",
+        }
+        buckets.append(bucket)
+        for item_idx in item_indexes:
+            assignment[item_idx] = bucket
+
+    for groups in bucket_groups:
+        add_bucket(groups)
+
+    return assignment, buckets
+
+
+def _frontend_memory_bucket_for_value(days: Any, model: dict[str, Any] | None) -> dict[str, Any]:
+    value = _frontend_memory_day_value(days)
+    buckets = list((model or {}).get("memoryBuckets") or [])
+    if not buckets:
+        return {
+            "key": f"value:{value}",
+            "label": f"{value}天",
+            "lower": value,
+            "upper": value,
+            "center": value,
+            "sort": 1,
+            "sampleCount": 0,
+            "bucketMode": "fixed_count",
+        }
+
+    containing = [bucket for bucket in buckets if int(bucket.get("lower") or 0) <= value <= int(bucket.get("upper") or 0)]
+    if containing:
+        return min(containing, key=lambda bucket: abs(float(bucket.get("center") or value) - value))
+
+    return min(buckets, key=lambda bucket: abs(float(bucket.get("center") or value) - value))
 
 
 def _frontend_bucket_study_count(count: Any, settings: dict[str, Any]) -> dict[str, Any]:
@@ -704,22 +794,22 @@ def _normalize_probability_distribution(again: Any, hard: Any, good: Any, easy: 
 
 def _build_frontend_probability_model(items: list[dict[str, Any]], probability_settings: dict[str, Any]) -> dict[str, Any]:
     settings = {
-        "logBase": max(1.1, float(probability_settings.get("logBase") or 2)),
-        "bucketSize": max(0.1, float(probability_settings.get("bucketSize") or 1)),
+        "memoryBucketMode": "fixed_count",
+        "memoryBucketSize": max(1, round(float(probability_settings.get("memoryBucketSize") or 10))),
         "studyCountBucketSize": max(1, round(float(probability_settings.get("studyCountBucketSize") or 5))),
         "useStudyCountDimension": probability_settings.get("useStudyCountDimension") is not False,
         "minCoordinateSamples": max(4, round(float(probability_settings.get("minCoordinateSamples") or 4))),
     }
-    memory_buckets: dict[str, dict[str, Any]] = {}
+    memory_assignment, fixed_memory_buckets = _frontend_build_fixed_count_memory_buckets(items, settings)
+    memory_buckets: dict[str, dict[str, Any]] = {bucket["key"]: bucket for bucket in fixed_memory_buckets}
     study_buckets: dict[str, dict[str, Any]] = {}
     by_memory_counts: dict[str, dict[str, float]] = {}
     by_key_counts: dict[str, dict[str, Any]] = {}
     global_counts = _empty_probability_counts()
 
     for idx, item in enumerate(items, start=1):
-        memory = _frontend_bucket_memory(item.get("currentIntervalDays") or item.get("expectedNextIntervalDays") or 1, settings)
+        memory = memory_assignment.get(idx) or _frontend_memory_bucket_for_value(item.get("currentIntervalDays") or item.get("expectedNextIntervalDays") or 1, {"memoryBuckets": fixed_memory_buckets})
         study = _frontend_bucket_study_count(item.get("studyCount") or 0, settings)
-        memory_buckets.setdefault(memory["key"], memory)
         study_buckets.setdefault(study["key"], study)
         dist = _normalize_probability_distribution(item.get("forgetProbability"), item.get("vagueProbability"), item.get("familiarProbability"), 0.0)
         probs = _prob_object_from_distribution(dist)
@@ -729,7 +819,7 @@ def _build_frontend_probability_model(items: list[dict[str, Any]], probability_s
             "key": coord_key,
             "memoryKey": memory["key"],
             "memoryLabel": memory["label"],
-            "memorySort": memory["lower"],
+            "memorySort": memory.get("sort", memory.get("lower", 0)),
             "studyKey": study["key"],
             "studyLabel": study["label"],
             "studySort": study["lower"],
@@ -748,7 +838,7 @@ def _build_frontend_probability_model(items: list[dict[str, Any]], probability_s
 
     fallback_distribution = _prob_distribution_from_counts(global_counts)
     memory_rows = []
-    for bucket in sorted(memory_buckets.values(), key=lambda row: row["lower"]):
+    for bucket in sorted(memory_buckets.values(), key=lambda row: row.get("sort", row.get("lower", 0))):
         counts = by_memory_counts.get(bucket["key"]) or _empty_probability_counts()
         distribution = _prob_distribution_from_counts(counts, fallback_distribution)
         probs = _prob_object_from_distribution(distribution)
@@ -758,23 +848,23 @@ def _build_frontend_probability_model(items: list[dict[str, Any]], probability_s
     by_key: dict[str, dict[str, Any]] = {}
     for key, coord in by_key_counts.items():
         counts = coord.get("counts") or _empty_probability_counts()
+        n = int(round(float(counts.get("n") or 0)))
         distribution = _prob_distribution_from_counts(counts, fallback_distribution)
         probs = _prob_object_from_distribution(distribution)
         by_key[key] = {
             **coord,
-            "n": int(round(float(counts.get("n") or 0))),
-            "total": int(round(float(counts.get("n") or 0))),
+            "n": n,
+            "total": n,
             "counts": {k: (int(round(v)) if k == "n" else v) for k, v in counts.items()},
             "modelCounts": counts,
-            "again": probs.get("again", 0.0) * float(counts.get("n") or 0),
-            "hard": probs.get("hard", 0.0) * float(counts.get("n") or 0),
-            "good": probs.get("good", 0.0) * float(counts.get("n") or 0),
-            "easy": probs.get("easy", 0.0) * float(counts.get("n") or 0),
+            "again": probs.get("again", 0.0) * float(n),
+            "hard": probs.get("hard", 0.0) * float(n),
+            "good": probs.get("good", 0.0) * float(n),
+            "easy": probs.get("easy", 0.0) * float(n),
             "probs": probs,
             "distribution": distribution,
             "usedNearestFallback": False,
             "fallbackMethod": "self",
-            "diffusionRadius": 0,
         }
 
     return {
@@ -818,6 +908,55 @@ def _prediction_distribution_for_word(word: dict[str, Any], global_distribution:
     return global_distribution or _normalize_probability_distribution(0.15, 0.25, 0.5, 0.1)
 
 
+def _normalize_trace_text(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().split())
+
+
+def _build_trace_match(items: list[dict[str, Any]], query: str) -> dict[str, Any]:
+    normalized = _normalize_trace_text(query)
+    if not normalized:
+        return {"query": "", "mode": "empty", "keys": set(), "matchedWords": []}
+
+    def item_key(item: dict[str, Any]) -> str:
+        return str(item.get("recordKey") or item.get("word") or "").strip()
+
+    exact: list[dict[str, Any]] = []
+    for item in items:
+        word = _normalize_trace_text(item.get("word"))
+        key = _normalize_trace_text(item_key(item))
+        if word == normalized or key == normalized:
+            exact.append(item)
+
+    if exact:
+        matched = exact
+        mode = "exact"
+    elif len(normalized) >= 2:
+        matched = [
+            item for item in items
+            if normalized in _normalize_trace_text(item.get("word")) or normalized in _normalize_trace_text(item_key(item))
+        ]
+        mode = "partial"
+    else:
+        matched = []
+        mode = "too_short"
+
+    seen: set[str] = set()
+    keys: set[str] = set()
+    matched_words: list[str] = []
+    for item in matched:
+        key = item_key(item)
+        if not key or key in keys:
+            continue
+        keys.add(key)
+        word = str(item.get("word") or key).strip()
+        word_key = _normalize_trace_text(word)
+        if word_key and word_key not in seen:
+            seen.add(word_key)
+            matched_words.append(word)
+
+    return {"query": normalized, "mode": mode, "keys": keys, "matchedWords": matched_words}
+
+
 def _count_frontend_target_words(words: dict[str, dict[str, Any]], target_settings: dict[str, Any], current_day: int) -> int:
     try:
         target_days = max(0.0, float(target_settings.get("days") or 0))
@@ -853,6 +992,17 @@ def _build_frontend_prediction_result(fsrs_payload: dict[str, Any], options: dic
     probability_model = _build_frontend_probability_model(items, probability_settings)
     global_distribution = probability_model.get("globalDistribution") or _normalize_probability_distribution(0.15, 0.25, 0.5, 0.1)
     latest_date = str(fsrs_payload.get("referenceDate") or datetime.now(timezone.utc).date().isoformat())
+    include_all_details = options.get("includeDetails") is True
+    detail_day: int | None = None
+    if options.get("detailDay") not in (None, ""):
+        try:
+            detail_day = max(1, int(float(options.get("detailDay"))))
+        except Exception:
+            detail_day = None
+    trace_query_raw = str(options.get("traceQuery") or "").strip()
+    trace_match = _build_trace_match(items, trace_query_raw)
+    trace_keys: set[str] = trace_match.get("keys") or set()
+    trace_query = trace_match.get("query") or ""
 
     queues: dict[int, list[dict[str, Any]]] = {}
     active_words: dict[str, dict[str, Any]] = {}
@@ -922,30 +1072,36 @@ def _build_frontend_prediction_result(fsrs_payload: dict[str, Any], options: dic
             next_due_day = day + max(1, int(round(next_stability)))
             word["nextDueDay"] = next_due_day
             queues.setdefault(next_due_day, []).append(word)
-            bucket = _frontend_bucket_memory(prev_stability, probability_model.get("settings") or {})
-            study_bucket = _frontend_bucket_study_count(word.get("studyCount") or 0, probability_model.get("settings") or {})
-            event = {
-                "day": day,
-                "date": current_date,
-                "action": "review",
-                "actionLabel": "模拟词复习" if word.get("source") == "generated" else "库存词复习",
-                "word": word.get("word"),
-                "key": word.get("key"),
-                "source": word.get("source"),
-                "sourceLabel": "模拟词" if word.get("source") == "generated" else "库存词",
-                "rating": rating,
-                "prevStability": prev_stability,
-                "nextStability": next_stability,
-                "nextDueDay": next_due_day,
-                "studyCount": word.get("studyCount"),
-                "probabilityBucket": f"{bucket.get('label')} × {study_bucket.get('label')}次",
-                "probabilityCellText": "-",
-                "probabilitySource": "后端 FSRS 概率",
-                "probabilityN": 0,
-                "probabilityDiffusionRadius": None,
-            }
-            day_events.append(event)
-            day_word_ratings.append(event)
+            word_text = str(word.get("word") or "")
+            key_text = str(word.get("key") or "")
+            capture_for_day = include_all_details or detail_day == day
+            capture_for_trace = bool(trace_query and key_text in trace_keys)
+            if capture_for_day or capture_for_trace:
+                bucket = _frontend_memory_bucket_for_value(prev_stability, probability_model)
+                study_bucket = _frontend_bucket_study_count(word.get("studyCount") or 0, probability_model.get("settings") or {})
+                event = {
+                    "day": day,
+                    "date": current_date,
+                    "action": "review",
+                    "actionLabel": "模拟词复习" if word.get("source") == "generated" else "库存词复习",
+                    "word": word_text,
+                    "key": key_text,
+                    "source": word.get("source"),
+                    "sourceLabel": "模拟词" if word.get("source") == "generated" else "库存词",
+                    "rating": rating,
+                    "prevStability": prev_stability,
+                    "nextStability": next_stability,
+                    "nextDueDay": next_due_day,
+                    "studyCount": word.get("studyCount"),
+                    "probabilityBucket": f"{bucket.get('label')} × {study_bucket.get('label')}次",
+                    "probabilityCellText": "-",
+                    "probabilitySource": "后端 FSRS 概率",
+                    "probabilityN": 0,
+                }
+                if capture_for_day:
+                    day_events.append(event)
+                if capture_for_trace:
+                    day_word_ratings.append(event)
 
         for _ in range(predicted_new):
             generated_index += 1
@@ -962,34 +1118,38 @@ def _build_frontend_prediction_result(fsrs_payload: dict[str, Any], options: dic
             }
             active_words[key] = word
             queues.setdefault(day + 1, []).append(word)
-            event = {
-                "day": day,
-                "date": current_date,
-                "action": "new",
-                "actionLabel": "模拟词新学",
-                "word": word["word"],
-                "key": key,
-                "source": "generated",
-                "sourceLabel": "模拟词",
-                "rating": "new",
-                "prevStability": 0,
-                "nextStability": 1,
-                "nextDueDay": day + 1,
-                "studyCount": 1,
-                "probabilityBucket": "新学：无复习概率分桶",
-                "probabilityCellText": "-",
-                "probabilitySource": "新学不抽复习概率",
-                "probabilityN": 0,
-                "probabilityDiffusionRadius": None,
-            }
-            day_events.append(event)
-            day_word_ratings.append(event)
+            capture_for_day = include_all_details or detail_day == day
+            capture_for_trace = bool(trace_query and key in trace_keys)
+            if capture_for_day or capture_for_trace:
+                event = {
+                    "day": day,
+                    "date": current_date,
+                    "action": "new",
+                    "actionLabel": "模拟词新学",
+                    "word": word["word"],
+                    "key": key,
+                    "source": "generated",
+                    "sourceLabel": "模拟词",
+                    "rating": "new",
+                    "prevStability": 0,
+                    "nextStability": 1,
+                    "nextDueDay": day + 1,
+                    "studyCount": 1,
+                    "probabilityBucket": "新学：无复习概率分桶",
+                    "probabilityCellText": "-",
+                    "probabilitySource": "新学不抽复习概率",
+                    "probabilityN": 0,
+                }
+                if capture_for_day:
+                    day_events.append(event)
+                if capture_for_trace:
+                    day_word_ratings.append(event)
 
         cumulative_new += predicted_new
         cumulative_review += len(reviews_today)
         target_matched = _count_frontend_target_words(active_words, target_settings, day)
         target_count = max(0, int(float(target_settings.get("count") or 0))) if isinstance(target_settings, dict) else 0
-        rows_out.append({
+        row_out = {
             "predictionDay": day,
             "futureDayLabel": day,
             "futureDayTitle": f"第{day}天",
@@ -1011,9 +1171,12 @@ def _build_frontend_prediction_result(fsrs_payload: dict[str, Any], options: dic
             "targetCount": target_count,
             "targetDays": target_settings.get("days") if isinstance(target_settings, dict) else 30,
             "targetMetric": target_settings.get("metric") if isinstance(target_settings, dict) else "review_span",
-            "words": day_events,
-        })
-        day_word_details.append({"day": day, "date": current_date, "words": day_events})
+        }
+        if day_events:
+            row_out["words"] = day_events
+        rows_out.append(row_out)
+        if include_all_details or detail_day == day:
+            day_word_details.append({"day": day, "date": current_date, "words": day_events})
 
     dist = probability_model.get("globalDistribution") or global_distribution
     label_map = {"again": "忘", "hard": "模", "good": "认", "easy": "Easy"}
@@ -1036,6 +1199,13 @@ def _build_frontend_prediction_result(fsrs_payload: dict[str, Any], options: dic
         "fsrsProfile": {"ratingDistribution": dist},
         "dayWordRatings": day_word_ratings,
         "dayWordDetails": day_word_details,
+        "traceMatch": {
+            "query": trace_query_raw,
+            "normalizedQuery": trace_match.get("query") or "",
+            "mode": trace_match.get("mode") or "",
+            "matchedWords": trace_match.get("matchedWords") or [],
+            "matchedWordCount": len(trace_match.get("matchedWords") or []),
+        },
         "referenceDate": latest_date,
         "backendFsrs": {
             "itemCount": fsrs_payload.get("itemCount"),

@@ -8,6 +8,7 @@
       <label>日期 <input v-model="selectedDate" type="date" style="width:150px"></label>
       <el-button size="small" :loading="loading" @click="loadDate">查看</el-button>
       <span class="info-text">{{ statusText }}</span>
+      <span v-if="selectedSnapshotLabel" class="info-text">当前时间点：{{ selectedSnapshotLabel }}</span>
     </div>
 
     <div class="field-toolbar">
@@ -72,7 +73,7 @@
             <tr v-if="!orderedSnapshots.length">
               <td colspan="24" class="empty-cell">暂无快照数据。</td>
             </tr>
-            <tr v-for="snapshot in orderedSnapshots" :key="snapshot.name || snapshot.displayName">
+            <tr v-for="snapshot in orderedSnapshots" :key="snapshot.name || snapshot.displayName" :class="{ selected: isSelectedSnapshot(snapshot) }">
               <td>{{ snapshot.displayName || snapshot.timeLabel || snapshot.name || '-' }}</td>
               <td>{{ valueOf(snapshot, 'finished') }}</td>
               <td>{{ valueOf(snapshot, 'total') }}</td>
@@ -106,7 +107,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useDataStore } from '@/stores/dataStore'
 import { useApi } from '@/composables/useApi'
 import BaseChart from '@/components/charts/BaseChart.vue'
@@ -161,12 +162,17 @@ const HOURLY_X_AXIS_LABEL = {
 const HOURLY_Y_AXIS_LABEL = { fontSize: 11 }
 
 const workspace = computed(() => dataStore.todayWorkspace || { date: '', snapshots: [], allProgressText: '', error: '' })
-
 const orderedSnapshots = computed(() => {
   const items = Array.isArray(workspace.value.snapshots) ? workspace.value.snapshots : []
   return [...items]
     .filter(snapshot => Number.isFinite(Number(snapshot?.timeMs)) || snapshot?.name || snapshot?.displayName)
     .sort((a, b) => snapshotMs(a) - snapshotMs(b))
+})
+
+const selectedSnapshotName = computed(() => dataStore.selectedTodaySnapshotName || orderedSnapshots.value[orderedSnapshots.value.length - 1]?.name || '')
+const selectedSnapshotLabel = computed(() => {
+  const snapshot = orderedSnapshots.value.find(item => item?.name === selectedSnapshotName.value)
+  return snapshot ? (snapshot.displayName || snapshot.timeLabel || snapshot.name || '') : ''
 })
 
 const statusText = computed(() => {
@@ -292,10 +298,6 @@ watch(() => workspace.value.date, value => {
   if (value) selectedDate.value = value
 }, { immediate: true })
 
-onMounted(() => {
-  if (workspace.value.date) selectedDate.value = workspace.value.date
-})
-
 function localDateString() {
   const d = new Date()
   const y = d.getFullYear()
@@ -369,6 +371,10 @@ function valueOf(snapshot, key, fallback = '-') {
   return fallback
 }
 
+function isSelectedSnapshot(snapshot) {
+  return Boolean(snapshot?.name && snapshot.name === selectedSnapshotName.value)
+}
+
 function formatHourTick(value) {
   const d = new Date(Number(value))
   const h = String(d.getHours()).padStart(2, '0')
@@ -414,9 +420,9 @@ async function loadDate() {
   try {
     const data = await api.fetchTodayWorkspace(selectedDate.value)
     if (data?.todayWorkspace) {
-      dataStore.todayWorkspace = data.todayWorkspace
+      dataStore.setTodayWorkspace(data.todayWorkspace)
     } else {
-      dataStore.todayWorkspace = { date: selectedDate.value, snapshots: [], allProgressText: '', error: '该日期暂无快照数据' }
+      dataStore.setTodayWorkspace({ date: selectedDate.value, snapshots: [], allProgressText: '', error: '该日期暂无快照数据' })
     }
   } finally {
     loading.value = false
@@ -473,6 +479,9 @@ async function loadDate() {
   border-bottom: 1px solid var(--border);
   font-size: 12px;
   text-align: right;
+}
+.snapshot-table tr.selected td {
+  background: rgba(20, 184, 166, .12);
 }
 .snapshot-table th:first-child,
 .snapshot-table td:first-child,

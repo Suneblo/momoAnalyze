@@ -22,8 +22,7 @@
       <label>新学/总量数值 <input v-model="settings.predictionDailyValue" type="number" min="0" step="1" placeholder="0"></label>
       <label>复习数量上限 <input v-model="settings.predictionReviewLimit" type="number" min="0" step="1" placeholder="不限制"></label>
       <label class="switch-label"><input v-model="settings.predictionUseStudyCountDimension" type="checkbox" @change="settings.save()"> 使用学习次数维度</label>
-      <label>对数底数 <input v-model.number="settings.predictionProbLogBase" type="number" min="1.1" step="0.1" @change="settings.save()"></label>
-      <label>记忆桶宽 <input v-model.number="settings.predictionProbBucketSize" type="number" min="0.1" step="0.1" @change="settings.save()"></label>
+      <label>记忆每桶目标词数 <input v-model.number="settings.predictionProbMemoryBucketSize" type="number" min="1" step="1" @change="settings.save()"></label>
       <label v-if="settings.predictionUseStudyCountDimension">学习次数桶宽 <input v-model.number="settings.predictionProbStudyCountBucketSize" type="number" min="1" step="1" @change="settings.save()"></label>
       <label>认识→
         <select v-model="settings.predictionRatingKnown" @change="settings.save()">
@@ -127,7 +126,7 @@
         </div>
         <div class="trace-controls">
           <input v-model.trim="traceWord" type="search" placeholder="输入单词">
-          <el-button size="small" @click="renderTrace">查看</el-button>
+          <el-button size="small" :loading="traceLoading" @click="renderTrace">查看</el-button>
         </div>
       </div>
       <div class="prediction-trace-result">
@@ -135,8 +134,8 @@
         <template v-else>
           <div class="trace-title">{{ traceResult.title }}</div>
           <div v-if="traceResult.rows.length" class="trace-list">
-            <div v-for="row in traceResult.rows" :key="`${row.day}-${row.nextDueDay}-${row.rating}`" class="trace-row">
-              第 {{ row.day }} 天 / {{ row.date }}：{{ row.actionLabel || (row.source === 'generated' ? '模拟词复习' : '库存词复习') }}，结果 {{ ratingLabel(row.rating) }}，概率分桶 {{ row.probabilityBucket || '-' }}，记忆持久度 {{ Math.round(row.prevStability) }} → {{ Math.round(row.nextStability) }} 天，下次第 {{ row.nextDueDay }} 天。
+            <div v-for="(row, index) in traceResult.rows" :key="`${row.key || row.word}-${row.day}-${row.nextDueDay}-${row.rating}-${index}`" class="trace-row">
+              第 {{ row.day }} 天 / {{ row.date }}：{{ row.word || row.key || '-' }}，{{ row.actionLabel || (row.source === 'generated' ? '模拟词复习' : '库存词复习') }}，结果 {{ ratingLabel(row.rating) }}，概率分桶 {{ row.probabilityBucket || '-' }}，记忆持久度 {{ Math.round(row.prevStability) }} → {{ Math.round(row.nextStability) }} 天，下次第 {{ row.nextDueDay }} 天。
             </div>
           </div>
           <div v-else class="info-text">本次预测周期内没有排到这个词，或没有找到匹配记录。</div>
@@ -147,7 +146,7 @@
 </template>
 
 <script setup>
-import { computed, inject, onMounted, ref } from 'vue'
+import { computed, inject, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useSettingsStore } from '@/stores/settingsStore'
 import { usePredictionStore } from '@/stores/predictionStore'
@@ -165,6 +164,8 @@ const isRunning = ref(false)
 const progress = ref({ current: 0, total: 0 })
 const traceWord = ref('')
 const traceResult = ref(null)
+const detailLoading = ref(false)
+const traceLoading = ref(false)
 const dayDetailVisible = ref(false)
 const selectedDayDetail = ref(null)
 
@@ -200,10 +201,6 @@ const predChartOption = computed(() => {
   ], { yUnit: '词数' })
 })
 
-onMounted(() => {
-  if (!prediction.result?.rows?.length) runPrediction()
-})
-
 function predictionOptions() {
   return {
     horizonDays: settings.predictionDays,
@@ -225,8 +222,7 @@ function predictionOptions() {
     modelFrom: settings.predictionModelFrom,
     modelTo: settings.predictionModelTo,
     probabilitySettings: {
-      logBase: settings.predictionProbLogBase,
-      bucketSize: settings.predictionProbBucketSize,
+      memoryBucketSize: settings.predictionProbMemoryBucketSize,
       studyCountBucketSize: settings.predictionProbStudyCountBucketSize,
       useStudyCountDimension: settings.predictionUseStudyCountDimension,
     },
@@ -273,7 +269,7 @@ function normalizeDayKey(value) {
   return String(value ?? '').trim()
 }
 
-function findDayDetail(rowOrDay) {
+function cachedDayDetail(rowOrDay) {
   const result = prediction.result
   if (!result) return null
   const day = normalizeDayKey(rowOrDay?.predictionDay ?? rowOrDay?.day ?? rowOrDay)
@@ -292,14 +288,45 @@ function findDayDetail(rowOrDay) {
   }
 }
 
-function openDayDetail(rowOrDay) {
-  const detail = findDayDetail(rowOrDay)
-  if (!detail || !detail.words.length) {
-    ElMessage.warning('这一天没有可显示的逐词明细，请重新运行一次预测。')
+async function findDayDetail(rowOrDay) {
+  const cached = cachedDayDetail(rowOrDay)
+  if (cached?.words?.length) return cached
+  const day = Number(cached?.day || rowOrDay?.predictionDay || rowOrDay?.day || rowOrDay)
+  if (!Number.isFinite(day) || day <= 0) return cached
+  detailLoading.value = true
+  try {
+    const data = await api.fetchFsrsPredictionDay({ ...predictionOptions(), day })
+    if (!data?.success) throw new Error(data?.error || '后端预测日明细失败')
+    const detail = data.detail || { day, date: cached?.date || '-', words: [] }
+    const result = prediction.result
+    if (result) {
+      const existing = Array.isArray(result.dayWordDetails) ? result.dayWordDetails : []
+      result.dayWordDetails = [...existing.filter(item => normalizeDayKey(item.day) !== normalizeDayKey(detail.day)), detail]
+    }
+    return {
+      day: Number(detail.day || day) || day,
+      date: detail.date || cached?.date || '-',
+      words: Array.isArray(detail.words) ? detail.words : [],
+    }
+  } finally {
+    detailLoading.value = false
+  }
+}
+
+async function openDayDetail(rowOrDay) {
+  try {
+    const detail = await findDayDetail(rowOrDay)
+    if (!detail || !detail.words.length) {
+      ElMessage.warning('这一天没有可显示的逐词明细')
+      return
+    }
+    selectedDayDetail.value = detail
+    dayDetailVisible.value = true
+  } catch (error) {
+    ElMessage.error(error.message || String(error))
+    log?.(`预测日明细加载失败：${error.message || error}`)
     return
   }
-  selectedDayDetail.value = detail
-  dayDetailVisible.value = true
 }
 
 function openDayDetailFromRow(row) {
@@ -317,15 +344,24 @@ function normalizeSearch(value) {
   return String(value || '').trim().toLowerCase()
 }
 
-function renderTrace() {
+async function renderTrace() {
   const query = normalizeSearch(traceWord.value)
   if (!query) {
     traceResult.value = null
     return
   }
-  const rows = (prediction.result?.dayWordRatings || []).filter(item => normalizeSearch(item.word).includes(query) || normalizeSearch(item.key).includes(query))
-  const title = rows.length ? `找到 ${rows.length} 条预测路径：${rows[0].word}` : `未找到：${traceWord.value}`
-  traceResult.value = { title, rows: rows.slice(0, 80) }
+  traceLoading.value = true
+  traceResult.value = { title: '查询中...', rows: [] }
+  try {
+    const data = await api.fetchFsrsPredictionTrace({ ...predictionOptions(), query })
+    if (!data?.success) throw new Error(data?.error || '后端单词追踪失败')
+    traceResult.value = data.trace || { title: `未找到：${traceWord.value}`, rows: [] }
+  } catch (error) {
+    traceResult.value = { title: `查询失败：${error.message || error}`, rows: [] }
+    ElMessage.error(error.message || String(error))
+  } finally {
+    traceLoading.value = false
+  }
 }
 </script>
 

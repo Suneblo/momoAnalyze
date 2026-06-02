@@ -6,6 +6,8 @@ Only the latest compact_v4_word_key schema is supported by runtime code.
 
 from __future__ import annotations
 
+import math
+
 from momo_db_common import *
 
 
@@ -134,6 +136,7 @@ COMPACT_REQUIRED_TABLES = {
     "progress",
     "words",
     "reviews",
+    "custom_words",
 }
 
 PATCH_EMPTY_MARKER = "enmpty"
@@ -194,6 +197,14 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_words_voc_id ON words(voc_id)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS custom_words(
+          voc_id TEXT PRIMARY KEY,
+          spelling TEXT NOT NULL
+        )
+        """
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS snaps(
@@ -394,6 +405,7 @@ def setup_schema(conn: sqlite3.Connection) -> None:
 
     required_columns = {
         "words": {"word_key", "spelling", "voc_id", "first_seen_at", "last_seen_at"},
+        "custom_words": {"voc_id", "spelling"},
         "records": {"study_day_key", "word_key", "snapshot_time", "voc_id", "spelling", "next_study_date", "study_count"},
         "days": {"study_day_key", "snapshot_time", "record_count", "created_at"},
         "record_events": {"study_day_key", "snapshot_time", "word_key", "voc_id", "event_type", "created_at"},
@@ -427,6 +439,248 @@ def setup_schema(conn: sqlite3.Connection) -> None:
         raise RuntimeError("SQLite schema_version 不是 compact_v4_word_key，请运行新版迁移。")
 
     conn.execute("PRAGMA optimize")
+
+
+# ---------------------------------------------------------------------------
+# Custom word spelling repair
+# ---------------------------------------------------------------------------
+
+
+def custom_word_placeholder(voc_id: str | None) -> str:
+    text = str(voc_id or "").strip()
+    tail = text[-12:] if text else "unknown"
+    return f"[custom:{tail}]"
+
+
+def _custom_word_key(voc_id: str | None) -> str:
+    text = str(voc_id or "").strip()
+    return f"voc:{text}" if text else ""
+
+
+def _custom_words_map(conn: sqlite3.Connection) -> dict[str, str]:
+    rows = conn.execute("SELECT voc_id, spelling FROM custom_words").fetchall()
+    out: dict[str, str] = {}
+    for row in rows:
+        voc_id = str(row["voc_id"] or "").strip()
+        spelling = str(row["spelling"] or "").strip()
+        if voc_id and spelling:
+            out[voc_id] = spelling
+    return out
+
+
+def _is_custom_placeholder(value: Any) -> bool:
+    text = str(value or "").strip()
+    return text.startswith("[custom:") and text.endswith("]")
+
+
+def _looks_like_voc_fallback(value: Any, voc_id: str | None = None) -> bool:
+    text = str(value or "").strip()
+    if not text.startswith("voc:"):
+        return False
+    return not voc_id or text == _custom_word_key(voc_id)
+
+
+def _apply_custom_word_spellings(conn: sqlite3.Connection, *collections: list[dict[str, Any]] | None) -> dict[str, int]:
+    custom_map = _custom_words_map(conn)
+    stats = {"empty": 0, "mapped": 0, "placeholder": 0}
+
+    for collection in collections:
+        for item in collection or []:
+            if not isinstance(item, dict):
+                continue
+            voc_id = canonical_voc_id(item)
+            if not voc_id:
+                continue
+            spelling = canonical_spelling(item)
+            if spelling:
+                continue
+
+            stats["empty"] += 1
+            resolved = custom_map.get(voc_id)
+            repaired = resolved or custom_word_placeholder(voc_id)
+            item["word_key"] = _custom_word_key(voc_id)
+            item["voc_spelling"] = repaired
+            item["spelling"] = repaired
+            if resolved:
+                stats["mapped"] += 1
+            else:
+                stats["placeholder"] += 1
+
+    return stats
+
+
+def _backfill_custom_word_spelling(conn: sqlite3.Connection, voc_id: str, spelling: str) -> dict[str, int]:
+    updates: dict[str, int] = {}
+    statements = [
+        ("words", "UPDATE words SET spelling=? WHERE voc_id=?", (spelling, voc_id)),
+        ("records", "UPDATE records SET spelling=? WHERE voc_id=?", (spelling, voc_id)),
+        ("study_items", "UPDATE study_items SET voc_spelling=? WHERE voc_id=?", (spelling, voc_id)),
+        ("study_events", "UPDATE study_events SET voc_spelling=? WHERE voc_id=?", (spelling, voc_id)),
+        ("reviews", "UPDATE reviews SET spelling=? WHERE voc_id=?", (spelling, voc_id)),
+    ]
+    for table, sql, params in statements:
+        cursor = conn.execute(sql, params)
+        updates[table] = int(cursor.rowcount or 0)
+    _RECONSTRUCT_CACHE.clear()
+    return updates
+
+
+def _assert_custom_word_spelling_unique(conn: sqlite3.Connection, voc_id: str, spelling: str) -> None:
+    custom_key = _custom_word_key(voc_id)
+    word_row = conn.execute(
+        """
+        SELECT word_key, voc_id, spelling
+        FROM words
+        WHERE TRIM(spelling)=? COLLATE NOCASE
+          AND word_key<>?
+          AND COALESCE(voc_id, '')<>?
+        LIMIT 1
+        """,
+        (spelling, custom_key, voc_id),
+    ).fetchone()
+    if word_row:
+        raise ValueError(f"拼写已存在于词库：{word_row['spelling']}")
+
+    custom_row = conn.execute(
+        """
+        SELECT voc_id, spelling
+        FROM custom_words
+        WHERE TRIM(spelling)=? COLLATE NOCASE
+          AND voc_id<>?
+        LIMIT 1
+        """,
+        (spelling, voc_id),
+    ).fetchone()
+    if custom_row:
+        raise ValueError(f"拼写已被另一个自定义词使用：{custom_row['spelling']}")
+
+
+def save_custom_word(conn: sqlite3.Connection, voc_id: str, spelling: str) -> dict[str, Any]:
+    setup_schema(conn)
+    vid = str(voc_id or "").strip()
+    word = str(spelling or "").strip()
+    if not vid:
+        raise ValueError("缺少 voc_id")
+    if not word:
+        raise ValueError("拼写不能为空")
+    if _is_custom_placeholder(word) or _looks_like_voc_fallback(word):
+        raise ValueError("请填写真实自定义词拼写")
+    _assert_custom_word_spelling_unique(conn, vid, word)
+
+    conn.execute(
+        """
+        INSERT INTO custom_words(voc_id, spelling)
+        VALUES(?,?)
+        ON CONFLICT(voc_id) DO UPDATE SET spelling=excluded.spelling
+        """,
+        (vid, word),
+    )
+    updates = _backfill_custom_word_spelling(conn, vid, word)
+    return {"vocId": vid, "spelling": word, "updated": updates}
+
+
+def _latest_progress_snapshot_for_day(conn: sqlite3.Connection, day_key: str) -> str | None:
+    row = conn.execute(
+        """
+        SELECT p.snapshot_time
+        FROM progress p
+        LEFT JOIN snaps s ON s.snapshot_time=p.snapshot_time
+        WHERE p.study_day_key=?
+          AND COALESCE(s.api_success, 1)=1
+          AND COALESCE(s.data_complete, 1)=1
+        ORDER BY p.snapshot_time DESC
+        LIMIT 1
+        """,
+        (day_key,),
+    ).fetchone()
+    return str(row["snapshot_time"]) if row else None
+
+
+def _custom_word_context_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "order": item.get("order"),
+        "word": item.get("voc_spelling") or item.get("word") or item.get("spelling") or "",
+        "vocId": item.get("voc_id") or item.get("vocId") or "",
+    }
+
+
+def _custom_word_due_state(next_study_date: Any, day_key: str) -> tuple[str, int | None]:
+    next_day = _date_only(next_study_date)
+    if not next_day:
+        return "", None
+    days = _days_between_date_text(day_key, next_day)
+    if days is None:
+        return "", None
+    if days > 0:
+        return f"逾期 {days} 天", days
+    if days == 0:
+        return "今日到期", 0
+    return f"{-days} 天后", days
+
+
+def get_today_custom_words(conn: sqlite3.Connection, day_key: str | None = None) -> dict[str, Any]:
+    setup_schema(conn)
+    day = day_key or study_day_key_from_dt()
+    snapshot_time = _latest_progress_snapshot_for_day(conn, day)
+    if not snapshot_time:
+        return {"date": day, "snapshot": "", "items": [], "total": 0, "resolvedCount": 0, "unresolvedCount": 0}
+
+    custom_map = _custom_words_map(conn)
+    items = reconstruct_study_day_items_at(conn, day, snapshot_time)
+    ordered = sorted(items, key=lambda x: (x.get("order") is None, x.get("order") if x.get("order") is not None else 10**12))
+    record_rows = conn.execute(
+        """
+        SELECT word_key, voc_id, study_count, next_study_date, last_response, last_response_cn, current_state
+        FROM records
+        WHERE study_day_key=?
+        """,
+        (day,),
+    ).fetchall()
+    records_by_key = {str(r["word_key"] or ""): r for r in record_rows if r["word_key"]}
+
+    out: list[dict[str, Any]] = []
+    resolved_count = 0
+    for index, item in enumerate(ordered):
+        voc_id = str(item.get("voc_id") or "").strip()
+        if not voc_id:
+            continue
+        word = str(item.get("voc_spelling") or "").strip()
+        is_custom = _is_custom_placeholder(word) or _looks_like_voc_fallback(word, voc_id)
+        if not is_custom and voc_id not in custom_map:
+            continue
+
+        resolved = custom_map.get(voc_id, "")
+        if resolved:
+            resolved_count += 1
+            continue
+
+        record = records_by_key.get(str(item.get("word_key") or ""))
+        due_state, overdue_days = _custom_word_due_state(row_value(record, "next_study_date"), day) if record else ("", None)
+        out.append({
+            "vocId": voc_id,
+            "vocIdTail": voc_id[-12:],
+            "order": item.get("order"),
+            "display": word or custom_word_placeholder(voc_id),
+            "isNew": item.get("is_new"),
+            "isFinished": item.get("is_finished"),
+            "firstResponse": item.get("first_response") or "",
+            "studyCount": row_value(record, "study_count"),
+            "lastResponse": row_value(record, "last_response_cn") or row_value(record, "last_response") or "",
+            "nextStudyDate": _date_only(row_value(record, "next_study_date")),
+            "dueState": due_state,
+            "overdueDays": overdue_days,
+            "before": [_custom_word_context_item(x) for x in ordered[max(0, index - 5):index]],
+            "after": [_custom_word_context_item(x) for x in ordered[index + 1:index + 6]],
+        })
+
+    return {
+        "date": day,
+        "snapshot": snapshot_time,
+        "items": out,
+        "total": len(out),
+        "resolvedCount": resolved_count,
+        "unresolvedCount": len(out),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1062,19 +1316,21 @@ def get_today_workspace(conn: sqlite3.Connection, day_key: str | None = None) ->
 
     snaps: list[dict[str, Any]] = []
     all_progress_lines: list[str] = []
-    skipped_missing_detail = 0
+    missing_detail_count = 0
 
     for row in rows:
-        if _v3_progress_detail_missing(row):
-            skipped_missing_detail += 1
-            continue
-
-        all_items = reconstruct_study_day_items_at(conn, day_key, row["snapshot_time"])
+        detail_missing = _v3_progress_detail_missing(row)
+        if detail_missing:
+            missing_detail_count += 1
+            all_items = []
+        else:
+            all_items = reconstruct_study_day_items_at(conn, day_key, row["snapshot_time"])
         try:
             overview_records = reconstruct_overview_records_at(conn, day_key, row["snapshot_time"])
         except Exception:
             overview_records = []
-        all_items = enrich_today_items_with_prediction_raw_data(all_items, overview_records, day_key, row["snapshot_time"], conn)
+        if all_items:
+            all_items = enrich_today_items_with_prediction_raw_data(all_items, overview_records, day_key, row["snapshot_time"], conn)
         active_items = [x for x in all_items if x.get("present_state") != "confirmed_absent"]
         done_items = [x for x in active_items if x.get("is_finished") is True]
         todo_items = [x for x in active_items if x.get("is_finished") is not True]
@@ -1082,6 +1338,18 @@ def get_today_workspace(conn: sqlite3.Connection, day_key: str | None = None) ->
         progress = {"finished": row["finished"], "total": row["total"], "study_time": row["study_time"]}
         breakdown = progress_today_breakdown(all_items)
         study_status = build_study_status_from_raw(day_key, overview_records, all_items, row, row["snapshot_time"])
+        if detail_missing:
+            row_finished = nullable_int(row["finished"]) or 0
+            row_total = nullable_int(row["total"]) or 0
+            row_study_time = nullable_int(row["study_time"]) or 0
+            study_status["today"].update({
+                "finished": row_finished,
+                "total": row_total,
+                "unfinished": max(row_total - row_finished, 0),
+                "studyTimeMs": row_study_time,
+                "studyTimeSeconds": row_study_time / 1000,
+            })
+            study_status["checks"]["detailMissing"] = True
         today_status = study_status.get("today") or {}
         overall_status = study_status.get("overall") or {}
         critical_status = study_status.get("critical") or {}
@@ -1139,6 +1407,7 @@ def get_today_workspace(conn: sqlite3.Connection, day_key: str | None = None) ->
             "todoItems": todo_items,
             "summary": summary,
             "studyStatus": study_status,
+            "detailMissing": detail_missing,
         }
         snaps.append(snap)
         all_progress_lines.append(
@@ -1152,14 +1421,793 @@ def get_today_workspace(conn: sqlite3.Connection, day_key: str | None = None) ->
         )
 
     error = "" if snaps else f"未读取到 {day_key} 的有效数据库快照"
-    if skipped_missing_detail and snaps:
-        error = f"已跳过 {skipped_missing_detail} 个缺少今日单词明细的快照"
+    if missing_detail_count and snaps:
+        error = f"包含 {missing_detail_count} 个仅有进度、缺少今日单词明细的快照"
     return {
         "date": day_key,
-        "snaps": snaps,
+        "snapshots": snaps,
         "allProgressText": "\n".join(all_progress_lines),
         "error": error,
-        "skippedMissingDetailSnapshots": skipped_missing_detail,
+        "skippedMissingDetailSnapshots": 0,
+        "missingDetailSnapshots": missing_detail_count,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Time-point frontend diff
+# ---------------------------------------------------------------------------
+
+
+def _timepoint_latest_day_with_two_snapshots(conn: sqlite3.Connection) -> str | None:
+    days = conn.execute(
+        """
+        SELECT DISTINCT p.study_day_key
+        FROM progress p
+        LEFT JOIN snaps s ON s.snapshot_time=p.snapshot_time
+        WHERE COALESCE(s.api_success, 1)=1
+          AND COALESCE(s.data_complete, 1)=1
+        ORDER BY p.study_day_key DESC
+        """
+    ).fetchall()
+    for row in days:
+        day = str(row["study_day_key"])
+        if len(_timepoint_candidate_rows(conn, day)) >= 2:
+            return day
+    return None
+
+
+def _timepoint_candidate_rows(conn: sqlite3.Connection, day_key: str) -> list[sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT p.*
+        FROM progress p
+        LEFT JOIN snaps s ON s.snapshot_time=p.snapshot_time
+        WHERE p.study_day_key=?
+          AND COALESCE(s.api_success, 1)=1
+          AND COALESCE(s.data_complete, 1)=1
+        ORDER BY p.snapshot_time ASC
+        """,
+        (day_key,),
+    ).fetchall()
+    return [row for row in rows if not _v3_progress_detail_missing(row)]
+
+
+def _timepoint_progress_row(conn: sqlite3.Connection, day_key: str, snapshot_time: str) -> sqlite3.Row | None:
+    row = conn.execute(
+        """
+        SELECT p.*
+        FROM progress p
+        LEFT JOIN snaps s ON s.snapshot_time=p.snapshot_time
+        WHERE p.study_day_key=?
+          AND p.snapshot_time=?
+          AND COALESCE(s.api_success, 1)=1
+          AND COALESCE(s.data_complete, 1)=1
+        LIMIT 1
+        """,
+        (day_key, snapshot_time),
+    ).fetchone()
+    return row if row and not _v3_progress_detail_missing(row) else None
+
+
+def _timepoint_display_name(snapshot_time: str) -> str:
+    return str(snapshot_time or "").replace("T", " ").split("+")[0]
+
+
+def _timepoint_snapshot_payload(
+    conn: sqlite3.Connection,
+    day_key: str,
+    row: sqlite3.Row,
+    memory_thresholds_text: str | None,
+) -> dict[str, Any]:
+    snapshot_time = str(row["snapshot_time"])
+    records = reconstruct_overview_records_at(conn, day_key, snapshot_time)
+    items = reconstruct_study_day_items_at(conn, day_key, snapshot_time)
+    if items:
+        items = enrich_today_items_with_prediction_raw_data(items, records, day_key, snapshot_time, conn)
+    summary = build_dashboard_summary_from_records(
+        records,
+        items,
+        day_key,
+        snapshot_time,
+        memory_thresholds_text=memory_thresholds_text,
+    )
+    study_status = build_study_status_from_raw(day_key, records, items, row, snapshot_time)
+    return {
+        "snapshot": snapshot_time,
+        "displayName": _timepoint_display_name(snapshot_time),
+        "records": records,
+        "items": items,
+        "summary": summary,
+        "studyStatus": study_status,
+        "rowCount": len(records),
+        "todayItemCount": len(items),
+    }
+
+
+def _timepoint_float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        out = float(value)
+        return out if out == out else None
+    except Exception:
+        return None
+
+
+def _timepoint_changed(before: Any, after: Any, digits: int = 2) -> bool:
+    a = _timepoint_float(before)
+    b = _timepoint_float(after)
+    if a is None and b is None:
+        return False
+    if a is None or b is None:
+        return True
+    return round(a, digits) != round(b, digits)
+
+
+def _timepoint_format_number(value: Any, digits: int = 2) -> str:
+    n = _timepoint_float(value)
+    if n is None:
+        return ""
+    rounded = round(n, digits)
+    if float(rounded).is_integer():
+        return str(int(rounded))
+    return f"{rounded:.{digits}f}".rstrip("0").rstrip(".")
+
+
+def _timepoint_markdown_table(headers: list[str], rows: list[list[Any]]) -> str:
+    def cell(value: Any) -> str:
+        return str(value if value is not None else "").replace("|", "\\|").replace("\n", " ")
+
+    if not rows:
+        return ""
+    header = "| " + " | ".join(cell(x) for x in headers) + " |"
+    sep = "| " + " | ".join("---" for _ in headers) + " |"
+    body = ["| " + " | ".join(cell(x) for x in row) + " |" for row in rows]
+    return "\n".join([header, sep, *body])
+
+
+def _timepoint_new_number(before: Any, after: Any, digits: int = 2) -> str:
+    if not _timepoint_changed(before, after, digits):
+        return "-"
+    return _timepoint_format_number(after, digits) or "-"
+
+
+def _timepoint_snapshot_row(
+    identity: list[Any],
+    before: dict[str, Any],
+    after: dict[str, Any],
+    fields: list[tuple[str, str, int]],
+) -> list[str]:
+    values = [_timepoint_new_number(before.get(key), after.get(key), digits) for _label, key, digits in fields]
+    return [str(value) for value in identity] + values if any(value != "-" for value in values) else []
+
+
+def _timepoint_snapshot_headers(identity_headers: list[str], fields: list[tuple[str, str, int]]) -> list[str]:
+    return [*identity_headers, *(label for label, _key, _digits in fields)]
+
+
+def _timepoint_nested(source: dict[str, Any], *keys: str) -> dict[str, Any]:
+    value: Any = source
+    for key in keys:
+        if not isinstance(value, dict):
+            return {}
+        value = value.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _timepoint_threshold_intersects_integer_range(
+    spec: dict[str, Any],
+    minimum: float,
+    maximum: float = float("inf"),
+) -> bool:
+    lower = spec.get("lower", float("-inf"))
+    upper = spec.get("upper", float("inf"))
+    lower_bound = math.ceil(lower) if lower != float("-inf") and spec.get("lowerInclusive", True) else (
+        math.floor(lower) + 1 if lower != float("-inf") else float("-inf")
+    )
+    upper_bound = math.floor(upper) if upper != float("inf") and spec.get("upperInclusive", True) else (
+        math.ceil(upper) - 1 if upper != float("inf") else float("inf")
+    )
+    range_minimum = math.ceil(minimum) if minimum != float("-inf") else float("-inf")
+    range_maximum = math.floor(maximum) if maximum != float("inf") else float("inf")
+    return max(lower_bound, range_minimum) <= min(upper_bound, range_maximum)
+
+
+def _timepoint_threshold_intersects_critical(spec: dict[str, Any]) -> bool:
+    return _timepoint_threshold_intersects_integer_range(spec, 0)
+
+
+def _timepoint_threshold_intersects_review_span(spec: dict[str, Any]) -> bool:
+    return (
+        _timepoint_threshold_intersects_integer_range(spec, 1)
+        and not _timepoint_threshold_intersects_integer_range(spec, float("-inf"), 0)
+    )
+
+
+def _timepoint_threshold_header_label(spec: dict[str, Any]) -> str:
+    spec_id = str(spec.get("id") or "")
+    if spec_id.startswith("exact:"):
+        return f"{spec_id.split(':', 1)[1]}天"
+    if spec_id.startswith("gte:"):
+        return f"≥{spec_id.split(':', 1)[1]}天"
+    if spec_id.startswith("gt:"):
+        return f">{spec_id.split(':', 1)[1]}天"
+    if spec_id.startswith("lte:"):
+        return f"≤{spec_id.split(':', 1)[1]}天"
+    if spec_id.startswith("lt:"):
+        value = spec_id.split(":", 1)[1]
+        return "逾期" if value == "0" else f"<{value}天"
+    if spec_id.startswith("range:"):
+        return f"{spec_id.split(':', 1)[1]}天"
+    return spec_id
+
+
+def _timepoint_memory_column_label(spec: dict[str, Any], mode: str) -> str:
+    label = _timepoint_threshold_header_label(spec)
+    if mode == "critical_point":
+        exact_zero = (
+            spec.get("lower") == 0
+            and spec.get("upper") == 0
+            and spec.get("lowerInclusive", True)
+            and spec.get("upperInclusive", True)
+        )
+        return f"遗忘临界点{label}{'（当日待复习）' if exact_zero else ''}（数量/平均学习次数）"
+    return f"记忆持久度{label}（数量/平均学习次数）"
+
+
+def _timepoint_memory_cell(
+    before_summary: dict[str, Any],
+    after_summary: dict[str, Any],
+    stat_key: str,
+    spec: dict[str, Any],
+) -> str:
+    spec_id = str(spec.get("id") or "")
+    before_stat = before_summary.get(stat_key) or {}
+    after_stat = after_summary.get(stat_key) or {}
+    before_count = (before_stat.get("counts") or {}).get(spec_id)
+    after_count = (after_stat.get("counts") or {}).get(spec_id)
+    before_avg = (before_stat.get("avgs") or {}).get(spec_id)
+    after_avg = (after_stat.get("avgs") or {}).get(spec_id)
+    if not _timepoint_changed(before_count, after_count, 0) and not _timepoint_changed(before_avg, after_avg, 2):
+        return "-"
+    count_text = _timepoint_format_number(after_count, 0) or "0"
+    avg_text = _timepoint_format_number(after_avg, 2) or "-"
+    return f"{count_text}/{avg_text}"
+
+
+def _timepoint_summary_increment_table(
+    day_key: str,
+    before: dict[str, Any],
+    after: dict[str, Any],
+    specs: list[dict[str, Any]],
+) -> tuple[list[str], list[list[str]]]:
+    before_summary = before["summary"]
+    after_summary = after["summary"]
+    headers = ["日期", "更新时间（总览更新时分秒）", "当日复习平均学习次数（全部复习词累计平均）"]
+    update_time = after["displayName"].split(" ", 1)[-1] if before["displayName"] != after["displayName"] else "-"
+    row = [
+        day_key,
+        update_time,
+        _timepoint_new_number(
+            before_summary.get("dailyAllReviewAvgStudyCount"),
+            after_summary.get("dailyAllReviewAvgStudyCount"),
+            2,
+        ),
+    ]
+
+    for spec in specs:
+        if _timepoint_threshold_intersects_critical(spec):
+            headers.append(_timepoint_memory_column_label(spec, "critical_point"))
+            row.append(_timepoint_memory_cell(before_summary, after_summary, "memoryCriticalStats", spec))
+        if _timepoint_threshold_intersects_review_span(spec):
+            headers.append(_timepoint_memory_column_label(spec, "review_span"))
+            row.append(_timepoint_memory_cell(before_summary, after_summary, "memoryReviewSpanStats", spec))
+
+    return headers, [row] if any(value != "-" for value in row[1:]) else []
+
+
+def _timepoint_memory_increment_table(
+    day_key: str,
+    before_summary: dict[str, Any],
+    after_summary: dict[str, Any],
+    specs: list[dict[str, Any]],
+) -> tuple[list[str], list[list[str]]]:
+    headers = ["日期"]
+    row = [day_key]
+    for spec in specs:
+        if not _timepoint_threshold_intersects_review_span(spec):
+            continue
+        headers.append(f"记忆持久度{_timepoint_threshold_header_label(spec)}")
+        before_count = ((before_summary.get("memoryReviewSpanStats") or {}).get("counts") or {}).get(str(spec.get("id") or ""))
+        after_count = ((after_summary.get("memoryReviewSpanStats") or {}).get("counts") or {}).get(str(spec.get("id") or ""))
+        row.append(_timepoint_new_number(before_count, after_count, 0))
+    return headers, [row] if any(value != "-" for value in row[1:]) else []
+
+
+def _timepoint_review_span_hist(records: list[dict[str, Any]]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for record in records:
+        days = _date_diff_days(record.get("next_study_date"), record.get("last_study_date"))
+        if days is None or days < 1:
+            continue
+        key = str(int(days))
+        out[key] = out.get(key, 0) + 1
+    return out
+
+
+def _timepoint_study_count_hist(records: list[dict[str, Any]]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for record in records:
+        count = _timepoint_float(record.get("study_count"))
+        if count is None:
+            continue
+        key = _timepoint_format_number(count, 1)
+        out[key] = out.get(key, 0) + 1
+    return out
+
+
+def _timepoint_hist_rows(
+    before_hist: dict[str, int],
+    after_hist: dict[str, int],
+    *,
+    suffix: str = "",
+    limit: int = 120,
+) -> list[list[str]]:
+    def sort_key(value: str) -> tuple[int, float | str]:
+        try:
+            return (0, float(value))
+        except Exception:
+            return (1, value)
+
+    rows: list[list[str]] = []
+    keys = sorted(set(before_hist) | set(after_hist), key=sort_key)
+    for key in keys:
+        av = before_hist.get(key, 0)
+        bv = after_hist.get(key, 0)
+        if av == bv:
+            continue
+        rows.append([f"{key}{suffix}", str(bv)])
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _timepoint_item_key(item: dict[str, Any]) -> str:
+    for key in ("voc_id", "vocId", "word_key", "wordKey", "voc_spelling", "word", "spelling"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _timepoint_item_finished(item: dict[str, Any] | None) -> bool:
+    return bool((item or {}).get("is_finished") or (item or {}).get("isFinished"))
+
+
+def _timepoint_item_response(item: dict[str, Any] | None) -> str:
+    return str((item or {}).get("first_response") or (item or {}).get("firstResponse") or "").strip()
+
+
+def _timepoint_real_response(value: str) -> bool:
+    return value in {"FAMILIAR", "VAGUE", "FORGET", "认识", "模糊", "忘记"}
+
+
+def _timepoint_item_memory_days(item: dict[str, Any] | None, previous: bool = False) -> float | None:
+    if not item:
+        return None
+    keys = (
+        ("previous_memory_durability_days", "previous_review_span_days", "previousMemoryReviewSpanDays", "previous_memory_review_span_days", "previousDays")
+        if previous
+        else ("memory_durability_days", "review_span_days", "memoryReviewSpanDays", "memory_review_span_days", "days")
+    )
+    for key in keys:
+        value = _timepoint_float(item.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _timepoint_item_study_count(item: dict[str, Any] | None, previous: bool = False) -> float | None:
+    if not item:
+        return None
+    keys = ("previous_study_count", "previousStudyCount") if previous else ("study_count", "studyCount")
+    for key in keys:
+        value = _timepoint_float(item.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _timepoint_items_reviewed_between(before_item: dict[str, Any] | None, after_item: dict[str, Any] | None) -> bool:
+    if not after_item:
+        return False
+    if not _timepoint_item_finished(before_item) and _timepoint_item_finished(after_item):
+        return True
+    before_response = _timepoint_item_response(before_item)
+    after_response = _timepoint_item_response(after_item)
+    return _timepoint_real_response(after_response) and before_response != after_response
+
+
+def _timepoint_reviewed_item_hist_rows(
+    before_items: list[dict[str, Any]],
+    after_items: list[dict[str, Any]],
+    *,
+    kind: str,
+) -> tuple[list[list[str]], int]:
+    before_map = {key: item for item in before_items if (key := _timepoint_item_key(item))}
+    after_map = {key: item for item in after_items if (key := _timepoint_item_key(item))}
+    before_hist: dict[str, int] = {}
+    after_hist: dict[str, int] = {}
+    reviewed_count = 0
+
+    for key, after_item in after_map.items():
+        before_item = before_map.get(key)
+        if not _timepoint_items_reviewed_between(before_item, after_item):
+            continue
+        reviewed_count += 1
+
+        if kind == "memory":
+            before_value = _timepoint_item_memory_days(before_item)
+            if before_value is None:
+                before_value = _timepoint_item_memory_days(after_item, previous=True)
+            after_value = _timepoint_item_memory_days(after_item)
+            suffix = "天"
+            digits = 1
+        else:
+            before_value = _timepoint_item_study_count(before_item)
+            if before_value is None:
+                before_value = _timepoint_item_study_count(after_item, previous=True)
+            after_value = _timepoint_item_study_count(after_item)
+            suffix = "次"
+            digits = 1
+
+        before_key = _timepoint_format_number(before_value, digits)
+        after_key = _timepoint_format_number(after_value, digits)
+        if before_key:
+            before_hist[before_key] = before_hist.get(before_key, 0) + 1
+        if after_key:
+            after_hist[after_key] = after_hist.get(after_key, 0) + 1
+
+    return _timepoint_hist_rows(before_hist, after_hist, suffix=suffix), reviewed_count
+
+
+TIMEPOINT_DIFF_SUPPORTED_COPY_KEYS = (
+    "overviewChart",
+    "todayWordStats",
+    "todayWorkspace",
+    "summary",
+    "memory",
+    "studyTime",
+)
+
+
+def _timepoint_normalize_copy_keys(copy_keys: list[str] | None) -> list[str]:
+    if not copy_keys:
+        return list(TIMEPOINT_DIFF_SUPPORTED_COPY_KEYS)
+    supported = set(TIMEPOINT_DIFF_SUPPORTED_COPY_KEYS)
+    out: list[str] = []
+    for key in copy_keys:
+        text = str(key or "").strip()
+        if text in supported and text not in out:
+            out.append(text)
+    return out
+
+
+def _timepoint_detail_enabled(copy_details: dict[str, Any] | None, copy_key: str, detail_key: str) -> bool:
+    details = (copy_details or {}).get(copy_key)
+    if not isinstance(details, dict) or detail_key not in details:
+        return True
+    return details.get(detail_key) is not False
+
+
+def _timepoint_diff_copy_text(
+    *,
+    day_key: str,
+    before: dict[str, Any],
+    after: dict[str, Any],
+    specs: list[dict[str, Any]],
+    critical_future_days: int,
+    selected_copy_keys: list[str] | None = None,
+    copy_details: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, int]]:
+    before_summary = before["summary"]
+    after_summary = after["summary"]
+    before_today = _timepoint_nested(before, "studyStatus", "today")
+    after_today = _timepoint_nested(after, "studyStatus", "today")
+    before_overall = _timepoint_nested(before, "studyStatus", "overall")
+    after_overall = _timepoint_nested(after, "studyStatus", "overall")
+    before_critical = _timepoint_nested(before, "studyStatus", "critical")
+    after_critical = _timepoint_nested(after, "studyStatus", "critical")
+
+    if "studyTimeMs" in before_today or "studyTimeMs" in after_today:
+        before_today["studyTimeMinutes"] = (_timepoint_float(before_today.get("studyTimeMs")) or 0) / 60000
+        after_today["studyTimeMinutes"] = (_timepoint_float(after_today.get("studyTimeMs")) or 0) / 60000
+
+    copy_keys = _timepoint_normalize_copy_keys(selected_copy_keys)
+    blocks_by_key: dict[str, list[tuple[str, str]]] = {key: [] for key in copy_keys}
+    counts: dict[str, int] = {}
+
+    sections = [
+        "# 最新时间点前端变化",
+        f"日期：{day_key}",
+        f"对比：{before['displayName']} -> {after['displayName']}",
+    ]
+
+    def add_block(copy_key: str, count_key: str, title: str, headers: list[str], rows: list[list[Any]]) -> None:
+        if copy_key not in blocks_by_key:
+            return
+        counts[count_key] = len(rows)
+        if rows:
+            blocks_by_key[copy_key].append((title, _timepoint_markdown_table(headers, rows)))
+
+    overall_fields = [
+        ("当前总词数", "totalWords", 0),
+        ("熟知", "wellKnown", 0),
+        ("顽固", "sticking", 0),
+        ("认识状态", "knownState", 0),
+        ("模糊状态", "vagueState", 0),
+        ("忘记状态", "forgetState", 0),
+        ("逾期", "overdue", 0),
+        ("平均学习次数", "avgStudyCount", 2),
+    ]
+    overall_row = _timepoint_snapshot_row([day_key], before_overall, after_overall, overall_fields)
+    if _timepoint_detail_enabled(copy_details, "overviewChart", "status"):
+        add_block(
+            "overviewChart",
+            "overallRows",
+            "复习情况 / 当前状态数据",
+            _timepoint_snapshot_headers(["日期"], overall_fields),
+            [overall_row] if overall_row else [],
+        )
+
+    today_fields = [
+        ("今日认识(已完成)", "known", 0),
+        ("今日模糊(已完成)", "vague", 0),
+        ("今日忘记(已完成)", "forget", 0),
+        ("已完成", "finished", 0),
+        ("未完成", "unfinished", 0),
+        ("总数", "total", 0),
+        ("今日已复习", "reviewDone", 0),
+        ("今日待复习", "reviewPending", 0),
+        ("今日复习总任务", "reviewTotal", 0),
+        ("今日已新学", "newDone", 0),
+        ("今日待新学", "newPending", 0),
+        ("今日新学总任务", "newTotal", 0),
+        ("今日全部认识", "allKnown", 0),
+        ("今日全部模糊", "allVague", 0),
+        ("今日全部忘记", "allForget", 0),
+        ("学习时长(分钟)", "studyTimeMinutes", 1),
+    ]
+    today_row = _timepoint_snapshot_row([day_key, after["displayName"]], before_today, after_today, today_fields)
+    if _timepoint_detail_enabled(copy_details, "overviewChart", "today"):
+        add_block(
+            "overviewChart",
+            "todayRows",
+            "复习情况 / 今日学习进度",
+            _timepoint_snapshot_headers(["日期", "快照时间"], today_fields),
+            [today_row] if today_row else [],
+        )
+
+    before_due = before_critical.get("dueByOffset") or {}
+    after_due = after_critical.get("dueByOffset") or {}
+    critical_fields = [("待复习(<=0天)", "dueToday")]
+    for offset in range(1, max(0, int(critical_future_days)) + 1):
+        critical_fields.append((f"{offset}天后临界", str(offset)))
+    critical_source_before = {"dueToday": before_critical.get("dueToday")}
+    critical_source_after = {"dueToday": after_critical.get("dueToday")}
+    for offset in range(1, max(0, int(critical_future_days)) + 1):
+        critical_source_before[str(offset)] = before_due.get(str(offset), 0)
+        critical_source_after[str(offset)] = after_due.get(str(offset), 0)
+    critical_value_fields = [(label, key, 0) for label, key in critical_fields]
+    critical_row = _timepoint_snapshot_row([day_key], critical_source_before, critical_source_after, critical_value_fields)
+    if _timepoint_detail_enabled(copy_details, "overviewChart", "critical"):
+        add_block(
+            "overviewChart",
+            "criticalRows",
+            "复习情况 / 记忆临界点统计",
+            _timepoint_snapshot_headers(["日期"], critical_value_fields),
+            [critical_row] if critical_row else [],
+        )
+
+    today_word_source_before = {
+        **before_today,
+        "criticalDueToday": before_critical.get("dueToday"),
+        "overdue": before_overall.get("overdue"),
+        "totalWords": before_overall.get("totalWords"),
+        "knownState": before_overall.get("knownState"),
+        "vagueState": before_overall.get("vagueState"),
+        "forgetState": before_overall.get("forgetState"),
+    }
+    today_word_source_after = {
+        **after_today,
+        "criticalDueToday": after_critical.get("dueToday"),
+        "overdue": after_overall.get("overdue"),
+        "totalWords": after_overall.get("totalWords"),
+        "knownState": after_overall.get("knownState"),
+        "vagueState": after_overall.get("vagueState"),
+        "forgetState": after_overall.get("forgetState"),
+    }
+    today_word_fields = [
+        ("已完成", "finished", 0),
+        ("总数", "total", 0),
+        ("未完成", "unfinished", 0),
+        ("记忆临界点(<=0天)", "criticalDueToday", 0),
+        ("逾期", "overdue", 0),
+        ("今日认识(已完成)", "known", 0),
+        ("今日模糊(已完成)", "vague", 0),
+        ("今日忘记(已完成)", "forget", 0),
+        ("今日认识(全部)", "allKnown", 0),
+        ("今日模糊(全部)", "allVague", 0),
+        ("今日忘记(全部)", "allForget", 0),
+        ("今日已复习", "reviewDone", 0),
+        ("今日待复习", "reviewPending", 0),
+        ("今日复习总任务", "reviewTotal", 0),
+        ("今日已新学", "newDone", 0),
+        ("今日待新学", "newPending", 0),
+        ("今日新学总任务", "newTotal", 0),
+        ("当前总词数", "totalWords", 0),
+        ("认识状态", "knownState", 0),
+        ("模糊状态", "vagueState", 0),
+        ("忘记状态", "forgetState", 0),
+        ("学习时长(分钟)", "studyTimeMinutes", 1),
+    ]
+    today_word_row = _timepoint_snapshot_row(
+        [after["displayName"], after["snapshot"]],
+        today_word_source_before,
+        today_word_source_after,
+        today_word_fields,
+    )
+    if _timepoint_detail_enabled(copy_details, "todayWordStats", "snapshots"):
+        add_block(
+            "todayWordStats",
+            "todayWordRows",
+            "当日单词统计 / 快照实时数据",
+            _timepoint_snapshot_headers(["快照时间", "原始快照"], today_word_fields),
+            [today_word_row] if today_word_row else [],
+        )
+
+    summary_headers, summary_rows = _timepoint_summary_increment_table(day_key, before, after, specs)
+    if _timepoint_detail_enabled(copy_details, "summary", "table"):
+        add_block("summary", "summaryRows", "按日期统计表 / 表格数据", summary_headers, summary_rows)
+
+    memory_headers, memory_rows = _timepoint_memory_increment_table(day_key, before_summary, after_summary, specs)
+    if _timepoint_detail_enabled(copy_details, "memory", "chart"):
+        add_block(
+            "memory",
+            "memoryRows",
+            "记忆持久度统计 / 图表数据",
+            memory_headers,
+            memory_rows,
+        )
+
+    study_time_fields = [("学习时长(分钟)", "studyTimeMinutes", 1)]
+    study_time_row = _timepoint_snapshot_row([day_key], before_today, after_today, study_time_fields)
+    if (
+        _timepoint_detail_enabled(copy_details, "studyTime", "chart")
+        or _timepoint_detail_enabled(copy_details, "studyTime", "summary")
+    ):
+        add_block(
+            "studyTime",
+            "studyTimeRows",
+            "每日学习时长统计 / 学习时长变化",
+            _timepoint_snapshot_headers(["日期"], study_time_fields),
+            [study_time_row] if study_time_row else [],
+        )
+
+    before_summary["studyTimeMinutes"] = (_timepoint_float(before_today.get("studyTimeMs")) or 0) / 60000
+    after_summary["studyTimeMinutes"] = (_timepoint_float(after_today.get("studyTimeMs")) or 0) / 60000
+    workspace_fields = [
+        ("已完成", "finished", 0),
+        ("总数", "total", 0),
+        ("今日首次忘记数", "firstForgetDone", 0),
+        ("今日全部首次忘记数", "firstForgetAll", 0),
+        ("今日模糊数(已完成)", "doneVague", 0),
+        ("今日模糊数(全部)", "allVague", 0),
+        ("今日认识数", "familiar", 0),
+        ("今日新学数", "newWords", 0),
+        ("今日复习数", "reviewWords", 0),
+        ("今日待新学数", "pendingNew", 0),
+        ("学习时长(分钟)", "studyTimeMinutes", 1),
+    ]
+    workspace_row = _timepoint_snapshot_row([after["displayName"]], before_summary, after_summary, workspace_fields)
+    if _timepoint_detail_enabled(copy_details, "todayWorkspace", "compare"):
+        add_block(
+            "todayWorkspace",
+            "workspaceRows",
+            "当日时间点查看 / 最近两个时间点对比",
+            _timepoint_snapshot_headers(["时间点"], workspace_fields),
+            [workspace_row] if workspace_row else [],
+        )
+
+    reviewed_memory_rows, reviewed_item_count = _timepoint_reviewed_item_hist_rows(before["items"], after["items"], kind="memory")
+    counts["reviewedItemCount"] = reviewed_item_count
+    if _timepoint_detail_enabled(copy_details, "todayWorkspace", "compare"):
+        add_block(
+            "todayWorkspace",
+            "reviewedItemMemoryRows",
+            f"当日时间点查看 / 本次新增完成复习词记忆持久度分布（{reviewed_item_count} 词）",
+            ["记忆持久度", "最新数量"],
+            reviewed_memory_rows,
+        )
+
+    reviewed_count_rows, _ = _timepoint_reviewed_item_hist_rows(before["items"], after["items"], kind="study_count")
+    if _timepoint_detail_enabled(copy_details, "todayWorkspace", "compare"):
+        add_block(
+            "todayWorkspace",
+            "reviewedItemStudyCountRows",
+            f"当日时间点查看 / 本次新增完成复习词学习次数分布（{reviewed_item_count} 词）",
+            ["学习次数", "最新数量"],
+            reviewed_count_rows,
+        )
+
+    emitted = 0
+    for copy_key in copy_keys:
+        for title, table in blocks_by_key.get(copy_key, []):
+            sections.extend(["", f"## {title}", table])
+            emitted += 1
+
+    if emitted <= 0:
+        return "", counts
+
+    return "\n".join(part for part in sections if part is not None), counts
+
+
+def get_timepoint_frontend_diff(
+    conn: sqlite3.Connection,
+    day_key: str | None = None,
+    snapshot_a: str | None = None,
+    snapshot_b: str | None = None,
+    memory_thresholds_text: str | None = None,
+    critical_future_days: int = 7,
+    selected_copy_keys: list[str] | None = None,
+    copy_details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    setup_schema(conn)
+    started = time.perf_counter()
+    day = str(day_key or "").strip() or _timepoint_latest_day_with_two_snapshots(conn)
+    if not day:
+        return {"date": "", "available": False, "error": "没有找到可对比的时间点"}
+
+    row_a = _timepoint_progress_row(conn, day, snapshot_a) if snapshot_a else None
+    row_b = _timepoint_progress_row(conn, day, snapshot_b) if snapshot_b else None
+    if row_a is None or row_b is None:
+        candidates = _timepoint_candidate_rows(conn, day)
+        if len(candidates) < 2:
+            return {"date": day, "available": False, "error": "该日期少于 2 个可对比时间点"}
+        row_a = row_a or candidates[-2]
+        row_b = row_b or candidates[-1]
+
+    specs = parse_memory_threshold_specs_from_text(memory_thresholds_text) or parse_memory_threshold_specs_from_text(FALLBACK_MEMORY_THRESHOLDS)
+    build_started = time.perf_counter()
+    before = _timepoint_snapshot_payload(conn, day, row_a, memory_thresholds_text)
+    after = _timepoint_snapshot_payload(conn, day, row_b, memory_thresholds_text)
+    copy_text, changed_counts = _timepoint_diff_copy_text(
+        day_key=day,
+        before=before,
+        after=after,
+        specs=specs,
+        critical_future_days=max(0, min(365, int(critical_future_days or 0))),
+        selected_copy_keys=selected_copy_keys,
+        copy_details=copy_details,
+    )
+
+    return {
+        "date": day,
+        "available": True,
+        "snapshotA": before["snapshot"],
+        "snapshotB": after["snapshot"],
+        "displayA": before["displayName"],
+        "displayB": after["displayName"],
+        "copyText": copy_text,
+        "changedCounts": changed_counts,
+        "rowCountA": before["rowCount"],
+        "rowCountB": after["rowCount"],
+        "todayItemCountA": before["todayItemCount"],
+        "todayItemCountB": after["todayItemCount"],
+        "timings": {
+            "buildSnapshotsMs": round((time.perf_counter() - build_started) * 1000, 2),
+            "totalMs": round((time.perf_counter() - started) * 1000, 2),
+        },
     }
 
 
@@ -1548,21 +2596,30 @@ def get_current_records_by_words(conn: sqlite3.Connection, words: list[str]) -> 
 # ---------------------------------------------------------------------------
 
 
-def _v3_upsert_word(conn: sqlite3.Connection, *, voc_id: str | None, spelling: str | None, captured_iso: str) -> None:
-    word_key = str(spelling or "").strip() or (f"voc:{str(voc_id).strip()}" if str(voc_id or "").strip() else "")
-    if not word_key:
+def _v3_upsert_word(
+    conn: sqlite3.Connection,
+    *,
+    word_key: str | None = None,
+    voc_id: str | None,
+    spelling: str | None,
+    captured_iso: str,
+) -> None:
+    key = str(word_key or "").strip()
+    if not key:
+        key = str(spelling or "").strip() or (f"voc:{str(voc_id).strip()}" if str(voc_id or "").strip() else "")
+    if not key:
         return
     vid = str(voc_id or "").strip() or None
     conn.execute(
         """
         INSERT INTO words(word_key, spelling, voc_id, first_seen_at, last_seen_at)
-        VALUES(?,?,?,?)
+        VALUES(?,?,?,?,?)
         ON CONFLICT(word_key) DO UPDATE SET
           voc_id=COALESCE(excluded.voc_id, words.voc_id),
           spelling=COALESCE(excluded.spelling, words.spelling),
           last_seen_at=excluded.last_seen_at
         """,
-        (word_key, spelling or word_key, vid, captured_iso, captured_iso),
+        (key, spelling or key, vid, captured_iso, captured_iso),
     )
 
 
@@ -1664,7 +2721,13 @@ def _v3_insert_study_snapshot(
 ) -> int:
     payloads = _v3_normalized_today_payloads(all_list)
     for p in payloads.values():
-        _v3_upsert_word(conn, voc_id=p.get("voc_id"), spelling=p.get("voc_spelling"), captured_iso=captured_iso)
+        _v3_upsert_word(
+            conn,
+            word_key=p.get("word_key"),
+            voc_id=p.get("voc_id"),
+            spelling=p.get("voc_spelling"),
+            captured_iso=captured_iso,
+        )
 
     has_initial = conn.execute("SELECT 1 FROM study_items WHERE study_day_key=? LIMIT 1", (study_day_key,)).fetchone() is not None
     if not has_initial:
@@ -1792,7 +2855,13 @@ def _v3_insert_overview_day(
             continue
         p["state_hash"] = record_state_hash(p)
         payloads[key] = p
-        _v3_upsert_word(conn, voc_id=p.get("voc_id"), spelling=p.get("spelling"), captured_iso=captured_iso)
+        _v3_upsert_word(
+            conn,
+            word_key=p.get("word_key"),
+            voc_id=p.get("voc_id"),
+            spelling=p.get("spelling"),
+            captured_iso=captured_iso,
+        )
 
     previous_rows = conn.execute("SELECT * FROM records WHERE study_day_key=?", (study_day_key,)).fetchall()
     previous = {str(r["word_key"]): r for r in previous_rows if r["word_key"]}
@@ -2014,6 +3083,8 @@ def import_api_snapshot(
     if not all_list and (done_list or todo_list):
         all_list = list(done_list) + list(todo_list)
 
+    custom_stats = _apply_custom_word_spellings(conn, all_list, done_list, todo_list, records)
+
     p = extract_progress(progress)
     progress_total = nullable_int(p.get("total")) or 0
     progress_finished = nullable_int(p.get("finished")) or 0
@@ -2106,6 +3177,7 @@ def import_api_snapshot(
         inserted_records=len(records),
         today_item_changes=today_changes,
         overview_changes=overview_changes,
+        custom_word_stats=custom_stats,
     )
 
 

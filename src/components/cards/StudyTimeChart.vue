@@ -28,6 +28,7 @@ import { computed } from 'vue'
 import { useDataStore } from '@/stores/dataStore'
 import { useSettingsStore } from '@/stores/settingsStore'
 import { sortRowsByDateAsc } from '@/utils/memoryThresholds'
+import { buildDashedGapLineSeries } from '@/utils/chartOptions'
 import BaseChart from '@/components/charts/BaseChart.vue'
 
 defineProps({ card: Object })
@@ -127,14 +128,18 @@ const chartOption = computed(() => {
   if (!rows.length) return null
 
   const labels = rows.map(row => row.date?.slice(5) || '')
-  const data = rows.map(row => formatMinutes(row.studyTimeMs))
+  const data = rows.map(row => row.hasProgressData ? formatMinutes(row.studyTimeMs) : null)
+  const color = '#e11d48'
 
   return {
     tooltip: {
       trigger: 'axis',
       formatter: params => {
         const index = params[0]?.dataIndex ?? 0
-        const value = params[0]?.value || 0
+        const value = params[0]?.value
+        if (value === null || value === undefined) {
+          return `${rows[index]?.date || params[0]?.axisValue}<br/><span style="color:#999">该日无进度数据，折线以虚线跨过。</span>`
+        }
         return `${rows[index]?.date || params[0]?.axisValue}<br/>每日学习时长：${value.toFixed(1)} 分钟<br/>${formatDuration(value * 60000)}`
       }
     },
@@ -148,10 +153,12 @@ const chartOption = computed(() => {
         type: 'line',
         data,
         smooth: false,
+        connectNulls: false,
         symbol: 'none',
-        lineStyle: { width: 2, color: '#e11d48' },
-        itemStyle: { color: '#e11d48' },
-      }
+        lineStyle: { width: 2, color },
+        itemStyle: { color },
+      },
+      ...buildDashedGapLineSeries(data, color, { name: '每日学习时长', width: 2 }),
     ]
   }
 })

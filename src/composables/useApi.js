@@ -16,6 +16,55 @@ function cloudWriteHeaders(headers = {}) {
   }
 }
 
+function apiResponseError(url, status, statusText, contentType, detail = '') {
+  const http = status ? `HTTP ${status}${statusText ? ` ${statusText}` : ''}` : '网络请求失败'
+  const type = contentType ? `，响应类型：${contentType}` : ''
+  const suffix = detail ? `；${detail}` : ''
+  return `${http}${type}：后端接口没有返回可用 JSON。请确认 Python 后端已启动，并且后端端口没有被前端/静态服务占用。接口：${url}${suffix}`
+}
+
+async function parseJsonResponse(resp, url) {
+  const contentType = resp.headers.get('content-type') || ''
+  const text = await resp.text()
+  const trimmed = text.trim()
+  const lowerType = contentType.toLowerCase()
+  const looksJson = lowerType.includes('json') || trimmed.startsWith('{') || trimmed.startsWith('[')
+
+  if (!looksJson) {
+    return {
+      success: false,
+      status: resp.status,
+      contentType,
+      error: apiResponseError(url, resp.status, resp.statusText, contentType),
+    }
+  }
+
+  let data
+  try {
+    data = trimmed ? JSON.parse(trimmed) : {}
+  } catch (e) {
+    return {
+      success: false,
+      status: resp.status,
+      contentType,
+      error: apiResponseError(url, resp.status, resp.statusText, contentType, e.message || String(e)),
+    }
+  }
+
+  if (!resp.ok) {
+    const payload = data && typeof data === 'object' && !Array.isArray(data) ? data : { result: data }
+    return {
+      ...payload,
+      success: false,
+      status: resp.status,
+      contentType,
+      error: payload.error || payload.message || `接口请求失败：HTTP ${resp.status}${resp.statusText ? ` ${resp.statusText}` : ''}`,
+    }
+  }
+
+  return data
+}
+
 export function useApi() {
   const loading = ref(false)
   const error = ref(null)
@@ -25,11 +74,12 @@ export function useApi() {
     error.value = null
     try {
       const resp = await fetch(cacheBust(url), { cache: 'no-store', ...options })
-      const data = await resp.json()
+      const data = await parseJsonResponse(resp, url)
+      if (data?.success === false && data.error) error.value = data.error
       return data
     } catch (e) {
       error.value = e.message || String(e)
-      return null
+      return { success: false, error: error.value }
     } finally {
       loading.value = false
     }
@@ -54,6 +104,28 @@ export function useApi() {
     return fetchJson(`/api/today-workspace${q}`)
   }
 
+  async function fetchTodayCustomWords(date) {
+    const q = date ? `?date=${encodeURIComponent(date)}` : ''
+    return fetchJson(`/api/custom-words/today${q}`)
+  }
+
+  async function saveCustomWord(payload = {}) {
+    return postJson('/api/custom-words', payload)
+  }
+
+  async function fetchTimepointDiff(options = {}) {
+    const params = new URLSearchParams()
+    if (options.date) params.set('date', String(options.date))
+    if (options.snapshotA) params.set('snapshotA', String(options.snapshotA))
+    if (options.snapshotB) params.set('snapshotB', String(options.snapshotB))
+    if (options.memoryThresholds) params.set('memoryThresholds', String(options.memoryThresholds))
+    if (options.criticalFutureDays !== undefined) params.set('criticalFutureDays', String(options.criticalFutureDays))
+    if (Array.isArray(options.copyKeys) && options.copyKeys.length) params.set('copyKeys', options.copyKeys.join(','))
+    if (options.copyDetails) params.set('copyDetails', JSON.stringify(options.copyDetails))
+    const q = params.toString()
+    return fetchJson(`/api/timepoint-diff${q ? `?${q}` : ''}`)
+  }
+
   async function fetchNotepads(limit = 10, offset = 0) {
     return fetchJson(`/api/notepads?limit=${encodeURIComponent(limit)}&offset=${encodeURIComponent(offset)}`)
   }
@@ -69,7 +141,7 @@ export function useApi() {
       if (resp.headers.get('Transfer-Encoding') === 'chunked') {
         const reader = resp.body.getReader()
         const decoder = new TextDecoder('utf-8')
-        let buffer = '', finalResult = null
+        let buffer = '', finalResult = null, finalError = ''
         while (true) {
           const { done, value } = await reader.read()
           if (done) break
@@ -82,16 +154,22 @@ export function useApi() {
               const data = JSON.parse(line)
               if (data.result) {
                 finalResult = data.result
+              } else if (data.error) {
+                finalError = String(data.error)
               }
             } catch (e) { /* ignore parse errors */ }
           }
         }
-        return finalResult
+        if (finalResult) return finalResult
+        if (finalError) return { success: false, error: finalError }
+        return { success: false, error: '同步接口未返回结果' }
       }
-      return resp.json()
+      const data = await parseJsonResponse(resp, '/api/sync')
+      if (data?.success === false && data.error) error.value = data.error
+      return data
     } catch (e) {
       error.value = e.message || String(e)
-      return null
+      return { success: false, error: error.value }
     } finally {
       loading.value = false
     }
@@ -110,10 +188,12 @@ export function useApi() {
         body: JSON.stringify(body),
         cache: 'no-store'
       })
-      return resp.json()
+      const data = await parseJsonResponse(resp, url)
+      if (data?.success === false && data.error) error.value = data.error
+      return data
     } catch (e) {
       error.value = e.message || String(e)
-      return null
+      return { success: false, error: error.value }
     } finally {
       loading.value = false
     }
@@ -143,6 +223,14 @@ export function useApi() {
     return postJson('/api/fsrs-prediction', payload)
   }
 
+  async function fetchFsrsPredictionDay(payload = {}) {
+    return postJson('/api/fsrs-prediction-day', payload)
+  }
+
+  async function fetchFsrsPredictionTrace(payload = {}) {
+    return postJson('/api/fsrs-prediction-trace', payload)
+  }
+
   return {
     loading,
     error,
@@ -150,6 +238,9 @@ export function useApi() {
     fetchDashboardPage,
     fetchAlerts,
     fetchTodayWorkspace,
+    fetchTodayCustomWords,
+    saveCustomWord,
+    fetchTimepointDiff,
     fetchNotepads,
     fetchNotepad,
     syncFromApi,
@@ -160,5 +251,7 @@ export function useApi() {
     analyzeArticle,
     advanceStudyWords,
     fetchFsrsPrediction,
+    fetchFsrsPredictionDay,
+    fetchFsrsPredictionTrace,
   }
 }

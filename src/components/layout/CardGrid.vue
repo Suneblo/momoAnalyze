@@ -1,7 +1,7 @@
 <template>
   <div class="card-grid">
     <template v-for="card in visibleCards" :key="card.id">
-      <div class="card" :class="{ 'wide-card': card.copyKey === 'overviewChart' }">
+      <div class="card" :class="{ 'wide-card': card.copyKey === 'overviewChart' || card.copyKey === 'customWords' }">
         <h2>{{ card.id }}</h2>
         <component :is="getComponent(card.copyKey)" :card="card" />
         <div class="inline-actions">
@@ -37,8 +37,7 @@
             <label style="margin-left:8px">忘记→<select v-model="settings.predictionRatingForget" @change="settings.save()"><option value="again">Again</option><option value="hard">Hard</option><option value="good">Good</option></select></label>
             <label style="margin-left:8px"><input v-model="settings.predictionUseStudyCountDimension" type="checkbox" @change="settings.save()"> 学习次数维度</label>
             <div class="info-text" style="margin-top:6px">概率分桶设置</div>
-            <label>底数 <input v-model.number="settings.predictionProbLogBase" type="number" min="1.1" step="0.1" style="width:60px" @change="settings.save()"></label>
-            <label style="margin-left:8px">桶宽 <input v-model.number="settings.predictionProbBucketSize" type="number" min="0.1" step="0.1" style="width:60px" @change="settings.save()"></label>
+            <label>记忆每桶目标词数 <input v-model.number="settings.predictionProbMemoryBucketSize" type="number" min="1" step="1" style="width:76px" @change="settings.save()"></label>
             <label style="margin-left:8px">次数桶宽 <input v-model.number="settings.predictionProbStudyCountBucketSize" type="number" min="1" step="1" style="width:70px" @change="settings.save()"></label>
           </div>
         </div>
@@ -73,6 +72,7 @@ const componentMap = {
   articleUnknownWords: defineAsyncComponent(() => import('@/components/cards/ArticleUnknownWordsCard.vue')),
   todayWorkspace: defineAsyncComponent(() => import('@/components/cards/TodayWorkspaceCard.vue')),
   dataAlert: defineAsyncComponent(() => import('@/components/cards/DataAlertCard.vue')),
+  customWords: defineAsyncComponent(() => import('@/components/cards/CustomWordsCard.vue')),
 }
 
 function getComponent(copyKey) { return componentMap[copyKey] || null }

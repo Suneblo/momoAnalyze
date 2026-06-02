@@ -63,18 +63,21 @@ from momo_db import (
     get_dashboard_data_page_light,
     get_latest_decrease_alerts,
     get_local_word_index,
+    get_timepoint_frontend_diff,
+    get_today_custom_words,
     get_today_workspace,
     import_api_snapshot,
     now_bj,
     query_words,
     record_incomplete_snapshot,
+    save_custom_word,
     setup_schema,
 )
 
 try:
-    from momo_fsrs import build_fsrs_dashboard_payload
+    from momo_fsrs import build_fsrs_prediction_result
 except Exception:
-    build_fsrs_dashboard_payload = None
+    build_fsrs_prediction_result = None
 
 try:
     from lemminflect import getAllLemmas
@@ -205,6 +208,13 @@ def sync_api_to_sqlite_browser(*, token_file: Path, db_path: Path, log_func=prin
     log_func(f"入库单词状态: {result.inserted_records}")
     log_func(f"接口总数: {expected_total}")
     log_func(f"自动拆分范围数: {leaf_ranges}")
+    if result.custom_word_stats:
+        log_func(
+            "自定义词补全："
+            f"空拼写={result.custom_word_stats.get('empty', 0)}，"
+            f"已映射={result.custom_word_stats.get('mapped', 0)}，"
+            f"占位={result.custom_word_stats.get('placeholder', 0)}。"
+        )
     log_func(f"今日进度：已完成={progress_data.get('finished', 0)}，总数={progress_data.get('total', 0)}。")
     log_func(
         "今日统计："
@@ -237,6 +247,7 @@ def sync_api_to_sqlite_browser(*, token_file: Path, db_path: Path, log_func=prin
         "expectedTotal": expected_total,
         "actualTotal": len(records),
         "leafRanges": leaf_ranges,
+        "customWordStats": result.custom_word_stats or {},
         "alerts": alerts,
         "deletedPreviousIncomplete": deleted,
         "source": "browser",
@@ -458,7 +469,7 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
 
     def translate_path(self, path: str) -> str:
         parsed = urlparse(path)
-        rel = unquote(parsed.path).lstrip("/") or "history_dashboard.html"
+        rel = unquote(parsed.path).lstrip("/") or "index.html"
         safe = Path(self.server.root_dir, *[part for part in rel.split("/") if part and part not in (".", "..")])
         return str(safe)
 
@@ -523,10 +534,17 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/fsrs-prediction":
             self.handle_fsrs_prediction()
             return
+        if parsed.path == "/api/fsrs-prediction-day":
+            self.handle_fsrs_prediction_day()
+            return
+        if parsed.path == "/api/fsrs-prediction-trace":
+            self.handle_fsrs_prediction_trace()
+            return
         if parsed.path.startswith("/api/notepads") or parsed.path in (
             "/api/article/analyze",
             "/api/study/advance",
             "/api/study/add-words",
+            "/api/custom-words",
         ):
             self.handle_write_api(parsed)
             return
@@ -536,18 +554,109 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
         request_start = time.perf_counter()
         self.server.begin_api_request(True)
         try:
-            if build_fsrs_dashboard_payload is None:
-                raise RuntimeError("未找到 momo_fsrs.build_fsrs_dashboard_payload")
-            _body = self.read_json_body()
+            if build_fsrs_prediction_result is None:
+                raise RuntimeError("未找到 momo_fsrs.build_fsrs_prediction_result")
+            body = self.read_json_body()
+            body["includeDetails"] = False
             with db_connect(self.server.db_path) as conn:
-                result = build_fsrs_dashboard_payload(conn, Path(self.server.root_dir))
-            service_log(f"API /api/fsrs-prediction 完成 itemCount={result.get('itemCount')} 耗时 {(time.perf_counter() - request_start) * 1000:.1f}ms")
-            self.send_json({"success": True, "prediction": result})
+                result = build_fsrs_prediction_result(conn, body, Path(self.server.root_dir))
+            service_log(
+                f"API /api/fsrs-prediction 完成 rows={len(result.get('rows') or [])} "
+                f"耗时 {(time.perf_counter() - request_start) * 1000:.1f}ms"
+            )
+            self.send_json({"success": True, "result": result})
         except ClientDisconnected:
             service_log(f"API /api/fsrs-prediction：浏览器已取消请求，总耗时 {(time.perf_counter() - request_start) * 1000:.1f}ms")
         except Exception as exc:
             service_log(f"API /api/fsrs-prediction 异常: {exc}\n{traceback.format_exc()}")
             self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, f"FSRS 预测错误: {exc}")
+        finally:
+            self.server.end_api_request(True)
+
+    def handle_fsrs_prediction_day(self) -> None:
+        request_start = time.perf_counter()
+        self.server.begin_api_request(True)
+        try:
+            if build_fsrs_prediction_result is None:
+                raise RuntimeError("未找到 momo_fsrs.build_fsrs_prediction_result")
+            body = self.read_json_body()
+            try:
+                detail_day = max(1, int(float(body.get("day") or body.get("detailDay") or 1)))
+            except Exception:
+                detail_day = 1
+            body["includeDetails"] = False
+            body["detailDay"] = detail_day
+            with db_connect(self.server.db_path) as conn:
+                result = build_fsrs_prediction_result(conn, body, Path(self.server.root_dir))
+            detail = None
+            for item in result.get("dayWordDetails") or []:
+                if str(item.get("day")) == str(detail_day):
+                    detail = item
+                    break
+            if detail is None:
+                row = next((x for x in result.get("rows") or [] if str(x.get("predictionDay")) == str(detail_day)), {})
+                detail = {
+                    "day": detail_day,
+                    "date": row.get("date") or "",
+                    "words": [],
+                }
+            service_log(
+                f"API /api/fsrs-prediction-day 完成 day={detail_day} "
+                f"words={len(detail.get('words') or [])} 耗时 {(time.perf_counter() - request_start) * 1000:.1f}ms"
+            )
+            self.send_json({"success": True, "detail": detail})
+        except ClientDisconnected:
+            service_log(f"API /api/fsrs-prediction-day：浏览器已取消请求，总耗时 {(time.perf_counter() - request_start) * 1000:.1f}ms")
+        except Exception as exc:
+            service_log(f"API /api/fsrs-prediction-day 异常: {exc}\n{traceback.format_exc()}")
+            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, f"FSRS 预测日明细错误: {exc}")
+        finally:
+            self.server.end_api_request(True)
+
+    def handle_fsrs_prediction_trace(self) -> None:
+        request_start = time.perf_counter()
+        self.server.begin_api_request(True)
+        try:
+            if build_fsrs_prediction_result is None:
+                raise RuntimeError("未找到 momo_fsrs.build_fsrs_prediction_result")
+            body = self.read_json_body()
+            query = str(body.get("query") or body.get("traceQuery") or "").strip()
+            if not query:
+                self.send_json({"success": True, "trace": {"title": "", "rows": []}})
+                return
+            body["includeDetails"] = False
+            body["traceQuery"] = query
+            with db_connect(self.server.db_path) as conn:
+                result = build_fsrs_prediction_result(conn, body, Path(self.server.root_dir))
+            all_rows = list(result.get("dayWordRatings") or [])
+            rows = all_rows[:80]
+            trace_match = result.get("traceMatch") if isinstance(result.get("traceMatch"), dict) else {}
+            matched_words = list(trace_match.get("matchedWords") or [])
+            match_mode = str(trace_match.get("mode") or "")
+            if rows:
+                if len(matched_words) == 1:
+                    title = f"找到 {len(all_rows)} 条预测路径：{matched_words[0]}"
+                else:
+                    preview = "、".join(str(x) for x in matched_words[:5])
+                    suffix = "，仅显示前 5 个匹配词" if len(matched_words) > 5 else ""
+                    mode_label = "模糊匹配" if match_mode == "partial" else "匹配"
+                    title = f"{mode_label} {len(matched_words)} 个词，找到 {len(all_rows)} 条预测路径：{preview}{suffix}"
+                if len(all_rows) > len(rows):
+                    title += f"（仅显示前 {len(rows)} 条）"
+            elif match_mode == "too_short":
+                title = f"未找到：{query}。请输入完整库存单词，或至少输入 2 个字符进行模糊匹配。"
+            else:
+                title = f"未找到：{query}"
+            service_log(
+                f"API /api/fsrs-prediction-trace 完成 query={query!r} rows={len(rows)} totalRows={len(all_rows)} "
+                f"耗时 {(time.perf_counter() - request_start) * 1000:.1f}ms"
+            )
+            self.send_json({"success": True, "trace": {"title": title, "rows": rows}})
+        except ClientDisconnected:
+            service_log(f"API /api/fsrs-prediction-trace：浏览器已取消请求，总耗时 {(time.perf_counter() - request_start) * 1000:.1f}ms")
+        except Exception as exc:
+            service_log(f"API /api/fsrs-prediction-trace 异常: {exc}\n{traceback.format_exc()}")
+            self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, f"FSRS 单词追踪错误: {exc}")
         finally:
             self.server.end_api_request(True)
 
@@ -558,6 +667,18 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
 
             if path in CLOUD_WRITE_PATHS and self.headers.get(CLOUD_WRITE_CONFIRM_HEADER) != CLOUD_WRITE_CONFIRM_VALUE:
                 self.send_error_json(HTTPStatus.PRECONDITION_REQUIRED, "危险云端写入需要先在页面确认，并等待 5 秒后再执行")
+                return
+
+            if path == "/api/custom-words":
+                voc_id = str(body.get("vocId") or body.get("voc_id") or "").strip()
+                spelling = str(body.get("spelling") or "").strip()
+                try:
+                    with db_connect(self.server.db_path) as conn:
+                        result = save_custom_word(conn, voc_id, spelling)
+                except ValueError as exc:
+                    self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+                    return
+                self.send_json({"success": True, "customWord": result})
                 return
 
             if path == "/api/notepads/create":
@@ -868,7 +989,7 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
         query = {key: value[-1] if value else "" for key, value in parse_qs(parsed.query).items()}
         service_log(f"API 开始 {parsed.path}?{parsed.query or ''}")
 
-        heavy_paths = {"/api/dashboard-data-page", "/api/words", "/api/today-workspace"}
+        heavy_paths = {"/api/dashboard-data-page", "/api/words", "/api/today-workspace", "/api/timepoint-diff"}
         track_request = parsed.path != "/api/health"
         is_heavy_request = parsed.path in heavy_paths
 
@@ -928,6 +1049,53 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
                     payload = {"success": True, "todayWorkspace": get_today_workspace(conn, day_key=workspace_date)}
                     service_log(f"API /api/today-workspace date={workspace_date} 耗时 {(time.perf_counter() - build_start) * 1000:.1f}ms")
                     self.send_json(payload)
+                    return
+
+                if parsed.path == "/api/custom-words/today":
+                    workspace_date = str(query.get("date") or "").strip() or None
+                    build_start = time.perf_counter()
+                    payload = {"success": True, "customWords": get_today_custom_words(conn, day_key=workspace_date)}
+                    service_log(f"API /api/custom-words/today date={workspace_date} 耗时 {(time.perf_counter() - build_start) * 1000:.1f}ms")
+                    self.send_json(payload)
+                    return
+
+                if parsed.path == "/api/timepoint-diff":
+                    workspace_date = str(query.get("date") or "").strip() or None
+                    snapshot_a = str(query.get("snapshotA") or query.get("a") or "").strip() or None
+                    snapshot_b = str(query.get("snapshotB") or query.get("b") or "").strip() or None
+                    memory_thresholds = str(query.get("memoryThresholds") or "").strip()
+                    try:
+                        critical_future_days = int(float(query.get("criticalFutureDays") or 7))
+                    except Exception:
+                        critical_future_days = 7
+                    selected_copy_keys = [
+                        part.strip()
+                        for part in str(query.get("copyKeys") or "").split(",")
+                        if part.strip()
+                    ] or None
+                    try:
+                        copy_details = json.loads(str(query.get("copyDetails") or "{}"))
+                        if not isinstance(copy_details, dict):
+                            copy_details = {}
+                    except Exception:
+                        copy_details = {}
+                    build_start = time.perf_counter()
+                    diff = get_timepoint_frontend_diff(
+                        conn,
+                        day_key=workspace_date,
+                        snapshot_a=snapshot_a,
+                        snapshot_b=snapshot_b,
+                        memory_thresholds_text=memory_thresholds,
+                        critical_future_days=critical_future_days,
+                        selected_copy_keys=selected_copy_keys,
+                        copy_details=copy_details,
+                    )
+                    service_log(
+                        f"API /api/timepoint-diff date={diff.get('date')} "
+                        f"a={diff.get('snapshotA')} b={diff.get('snapshotB')} "
+                        f"耗时 {(time.perf_counter() - build_start) * 1000:.1f}ms"
+                    )
+                    self.send_json({"success": True, "diff": diff})
                     return
 
                 if parsed.path == "/api/words":
@@ -1067,7 +1235,7 @@ def main() -> int:
     service_log("墨墨 SQLite 本地服务已启动")
     service_log(f"项目目录: {root}")
     service_log(f"数据库: {db_path}")
-    service_log(f"访问地址: http://{args.host}:{args.port}/history_dashboard.html")
+    service_log(f"访问地址: http://{args.host}:{args.port}/")
     service_log("提示: 查看完毕后，请在 Termux 中按 Ctrl + C 停止服务")
     service_log("------------------------------------------------")
 

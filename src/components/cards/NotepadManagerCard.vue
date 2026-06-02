@@ -35,7 +35,7 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { ref } from 'vue'
 import { useApi } from '@/composables/useApi'
 
 defineProps({ card: Object })
@@ -169,7 +169,6 @@ async function saveSelected() {
   }
 }
 
-onMounted(loadNotepads)
 </script>
 
 <style scoped>

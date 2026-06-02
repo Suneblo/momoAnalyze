@@ -6,6 +6,8 @@ import { useSettingsStore } from '@/stores/settingsStore'
 import {
   buildSummaryMarkdown,
   displayRowsOnly,
+  formatDuration,
+  formatPredictionCount,
   markdownTable,
   sortRowsByDateAsc,
 } from '@/utils/dashboardParity'
@@ -17,6 +19,26 @@ import { countReviewSpanForThreshold, getReviewSpanThresholds } from '@/utils/me
 
 
 const STUDY_STATUS_CARD_ID = '复习情况'
+const ROW_DEPENDENT_COPY_KEYS = new Set(['summary', 'overviewChart', 'studyTime', 'memory'])
+
+function hasUsefulCopyContent(copyKey, markdown) {
+  const text = String(markdown || '').trim()
+  if (!text) return false
+  if (copyKey === 'notes') return true
+  const emptyPatterns = [
+    '_未勾选',
+    '_暂无',
+    '_无数据_',
+    '暂无预测数据',
+    '暂无复习概率分桶数据',
+    '未查询单词列表',
+    '暂无时间点',
+    '暂无当日时间点数据',
+    '暂无快照数据',
+    '快照不足两个',
+  ]
+  return !emptyPatterns.some(pattern => text.includes(pattern))
+}
 
 function formatCount(n) {
   const value = Number(n)
@@ -198,6 +220,74 @@ function formatMsToSeconds(ms) {
   return Number.isFinite(n) ? (n / 1000).toFixed(1) : '-'
 }
 
+function buildStudyTimeSummary(rows) {
+  const cleanRows = displayRowsOnly(rows)
+  const progressRows = cleanRows.filter(row => row?.hasProgressData !== false)
+  const totalMs = progressRows.reduce((sum, row) => sum + (Number(row.studyTimeMs) || 0), 0)
+  const nonZeroRows = progressRows.filter(row => Number(row.studyTimeMs) > 0)
+  const maxRow = nonZeroRows.reduce((best, row) => {
+    if (!best || Number(row.studyTimeMs) > Number(best.studyTimeMs)) return row
+    return best
+  }, null)
+
+  return [
+    '## 学习时长汇总',
+    markdownTable(
+      ['统计项', '值'],
+      [
+        ['显示天数', cleanRows.length],
+        ['有进度数据天数', progressRows.length],
+        ['有学习时长天数', nonZeroRows.length],
+        ['总学习时长', formatDuration(totalMs)],
+        ['总学习时长(分钟)', (totalMs / 60000).toFixed(1)],
+        ['平均每个显示日(分钟)', cleanRows.length ? (totalMs / 60000 / cleanRows.length).toFixed(1) : '-'],
+        ['平均每个有进度日(分钟)', progressRows.length ? (totalMs / 60000 / progressRows.length).toFixed(1) : '-'],
+        ['最高学习时长日期', maxRow ? `${maxRow.date || '-'} / ${((Number(maxRow.studyTimeMs) || 0) / 60000).toFixed(1)} 分钟` : '-'],
+      ]
+    ),
+  ].join('\n')
+}
+
+function buildProbabilityMarkdown(model) {
+  const probabilityRows = buildProbabilityTableRows(model)
+  if (!probabilityRows.length) return '暂无复习概率分桶数据。'
+  const studyHeaders = model?.useStudyCountDimension === false
+    ? ['全部']
+    : (probabilityRows.studyRows || model?.studyBuckets || []).map(row => row.label)
+  return [
+    '## 复习概率分桶',
+    markdownTable(
+      ['记忆持久度 \\ 学习次数', ...studyHeaders],
+      probabilityRows.map(row => [row.memory.label, ...row.cells.map(cell => cell.text)])
+    ),
+    '单元格格式：n/忘/模/认/Easy；n 为该区域真实样本数。- 表示合并后仍不足目标词数，空白格表示被上方合并区域覆盖。',
+  ].join('\n')
+}
+
+function buildPredictionForecastSummary(result) {
+  if (!result?.rows?.length) return '暂无预测数据。'
+  const rows = result.rows || []
+  const totalNew = rows.reduce((sum, row) => sum + (Number(row.predictedNew) || 0), 0)
+  const totalReview = rows.reduce((sum, row) => sum + (Number(row.predictedReview) || 0), 0)
+  return [
+    '## 预测概要',
+    markdownTable(
+      ['项目', '值'],
+      [
+        ['模型参考日', result.referenceDate || '-'],
+        ['预测天数', rows.length],
+        ['预测日期范围', `${rows[0]?.date || '-'} ~ ${rows[rows.length - 1]?.date || '-'}`],
+        ['预测新学总量', formatPredictionCount(totalNew)],
+        ['预测复习总量', formatPredictionCount(totalReview)],
+        ['预测总学习量', formatPredictionCount(totalNew + totalReview)],
+        ['模拟词量', formatCount(result.simulationWordCount || 0)],
+        ['概率样本', formatCount(result.distSummary?.sampleCount || result.reviewSampleCount || 0)],
+        ['全局概率', result.distSummary?.global || '-'],
+      ]
+    ),
+  ].join('\n')
+}
+
 function buildTodayWordStatsSection(dataStore) {
   const workspace = dataStore.todayWorkspace || {}
   const snapshots = Array.isArray(workspace.snapshots)
@@ -216,32 +306,34 @@ function buildTodayWordStatsSection(dataStore) {
   return [
     `日期：${workspace.date || '-'}`,
     '单位：横轴从当天 04:00 开始，每小时一个刻度；折线点按数据库原始快照时间落点。',
-    markdownTable(headers, snapshots.map(snapshot => [
-      snapshot.displayName || snapshot.timeLabel || snapshot.name || '-',
-      snapshot.name || '-',
-      formatCount(getSnapshotSummaryValue(snapshot, 'finished')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'total')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'unfinished')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'criticalDueToday')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'overdue')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'known')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'vague')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'forget')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'allKnown')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'allVague')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'allForget')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'reviewDone')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'reviewPending')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'reviewTotal')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'newDone')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'newPending')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'newTotal')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'totalWords')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'knownState')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'vagueState')),
-      formatCount(getSnapshotSummaryValue(snapshot, 'forgetState')),
-      formatMsToSeconds(getSnapshotSummaryValue(snapshot, 'studyTimeMs', 0)),
-    ])),
+    snapshots.length
+      ? markdownTable(headers, snapshots.map(snapshot => [
+        snapshot.displayName || snapshot.timeLabel || snapshot.name || '-',
+        snapshot.name || '-',
+        formatCount(getSnapshotSummaryValue(snapshot, 'finished')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'total')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'unfinished')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'criticalDueToday')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'overdue')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'known')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'vague')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'forget')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'allKnown')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'allVague')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'allForget')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'reviewDone')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'reviewPending')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'reviewTotal')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'newDone')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'newPending')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'newTotal')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'totalWords')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'knownState')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'vagueState')),
+        formatCount(getSnapshotSummaryValue(snapshot, 'forgetState')),
+        formatMsToSeconds(getSnapshotSummaryValue(snapshot, 'studyTimeMs', 0)),
+      ]))
+      : '_暂无快照数据_',
   ].join('\n')
 }
 
@@ -262,7 +354,17 @@ function getTodayWorkspaceCopyState() {
     compareA: '',
     compareB: '',
     singleOptions: { progress: true, allItems: false, doneItems: false, todoItems: false },
-    compareOptions: { progress: true, added: true, removed: true, statusChanged: true, responseChanged: true },
+    compareOptions: {
+      tableStats: true,
+      progress: true,
+      added: true,
+      removed: true,
+      statusChanged: true,
+      responseChanged: true,
+      memoryChanged: true,
+      studyCountChanged: true,
+      studyTimeChanged: false,
+    },
   }
   try {
     const saved = JSON.parse(localStorage.getItem(TODAY_WORKSPACE_COPY_STATE_KEY) || '{}') || {}
@@ -364,7 +466,7 @@ function buildTodayWorkspaceSummarySection(snapshots) {
   ]
   return [
     '## 时间点列表',
-    markdownTable(headers, snapshots.map(workspaceProgressRow)),
+    snapshots.length ? markdownTable(headers, snapshots.map(workspaceProgressRow)) : '_暂无时间点数据_',
   ].join('\n')
 }
 
@@ -625,67 +727,93 @@ export function buildSingleCardMarkdown(copyKey) {
   const settings = useSettingsStore()
   const cardStore = useCardStore()
   const rows = getDisplayRows()
-  if (!rows.length && !['wordList', 'todayWorkspace', 'todayWordStats'].includes(copyKey)) return ''
 
   const parts = []
   const now = new Date().toLocaleString('zh-CN', { hour12: false })
 
   if (copyKey === 'summary') {
     parts.push(`# 按日期统计表\n生成时间：${now}\n`)
-    parts.push(buildSummaryMarkdown(rows, settings.memoryThresholds))
+    if (getCopyDetailEnabled(cardStore, '按日期统计表', 'table')) {
+      parts.push(buildSummaryMarkdown(rows, settings.memoryThresholds))
+    } else {
+      parts.push('_未勾选按日期统计表复制明细_')
+    }
   } else if (copyKey === 'overviewChart') {
     parts.push(buildStudyStatusMarkdown(rows, settings, cardStore))
   } else if (copyKey === 'studyTime') {
     parts.push(`# 学习时长数据\n`)
-    const headers = ['日期', '学习时长(分钟)']
-    const tableRows = displayRowsOnly(rows).map(row => [row.date || '-', ((Number(row.studyTimeMs) || 0) / 60000).toFixed(1)])
-    parts.push(markdownTable(headers, tableRows))
+    let selected = 0
+    if (getCopyDetailEnabled(cardStore, '每日学习时长统计', 'chart')) {
+      const headers = ['日期', '学习时长(分钟)']
+      const tableRows = displayRowsOnly(rows).map(row => [row.date || '-', ((Number(row.studyTimeMs) || 0) / 60000).toFixed(1)])
+      parts.push('## 每日学习时长', markdownTable(headers, tableRows))
+      selected += 1
+    }
+    if (getCopyDetailEnabled(cardStore, '每日学习时长统计', 'summary')) {
+      parts.push(buildStudyTimeSummary(rows))
+      selected += 1
+    }
+    if (!selected) parts.push('_未勾选学习时长复制明细_')
   } else if (copyKey === 'memory') {
     parts.push(`# 记忆持久度统计\n`)
-    const thresholds = getReviewSpanThresholds(settings.memoryThresholds)
-    if (thresholds.length) {
-      const headers = ['日期', ...thresholds.map(spec => `记忆持久度${spec.headerLabel}`)]
-      const tableRows = displayRowsOnly(rows)
-        .filter(row => row.hasOverviewData)
-        .map(row => [
-          row.date || '-',
-          ...thresholds.map(spec => formatCount(countReviewSpanForThreshold(row, spec))),
-        ])
-      parts.push(markdownTable(headers, tableRows))
+    if (!getCopyDetailEnabled(cardStore, '记忆持久度统计', 'chart')) {
+      parts.push('_未勾选记忆持久度复制明细_')
     } else {
-      parts.push('_无数据_\n')
+      const thresholds = getReviewSpanThresholds(settings.memoryThresholds)
+      if (thresholds.length) {
+        const headers = ['日期', ...thresholds.map(spec => `记忆持久度${spec.headerLabel}`)]
+        const tableRows = displayRowsOnly(rows)
+          .filter(row => row.hasOverviewData)
+          .map(row => [
+            row.date || '-',
+            ...thresholds.map(spec => formatCount(countReviewSpanForThreshold(row, spec))),
+          ])
+        parts.push(markdownTable(headers, tableRows))
+      } else {
+        parts.push('_无数据_\n')
+      }
     }
   } else if (copyKey === 'prediction') {
     parts.push(`# 未来每日学习量预测\n`)
-    parts.push(buildPredictionMarkdown(prediction.result))
+    const result = prediction.result
+    let selected = 0
+    if (getCopyDetailEnabled(cardStore, '未来每日学习量预测', 'forecast')) {
+      parts.push(buildPredictionForecastSummary(result))
+      selected += 1
+    }
+    if (getCopyDetailEnabled(cardStore, '未来每日学习量预测', 'table')) {
+      parts.push('## 预测表格', buildPredictionMarkdown(result))
+      selected += 1
+    }
+    if (getCopyDetailEnabled(cardStore, '未来每日学习量预测', 'probability')) {
+      parts.push(buildProbabilityMarkdown(result?.probabilityModel))
+      selected += 1
+    }
+    if (!selected) parts.push('_未勾选预测复制明细_')
   } else if (copyKey === 'predictionTarget') {
     parts.push(`# 目标达标与复习概率\n`)
     const result = prediction.result
-    if (result?.rows?.length) {
+    let selected = 0
+    if (getCopyDetailEnabled(cardStore, '目标达标与复习概率', 'chart')) {
       parts.push(markdownTable(
         ['几天后', '日期', '目标达标词数', '目标词数', '目标天数', '目标口径'],
-        result.rows.map(row => [row.predictionDay, row.date, row.dailyTargetMatchedCount, row.targetCount || '-', row.targetDays, row.targetMetric])
+        (result?.rows || []).map(row => [row.predictionDay, row.date, row.dailyTargetMatchedCount, row.targetCount || '-', row.targetDays, row.targetMetric])
       ))
-      const model = result.probabilityModel
-      const probabilityRows = buildProbabilityTableRows(model)
-      if (probabilityRows.length) {
-        const studyHeaders = model?.useStudyCountDimension === false
-          ? ['全部']
-          : (model?.studyBuckets || []).map(row => row.label)
-        parts.push('\n## 复习概率分桶')
-        parts.push(markdownTable(
-          ['记忆持久度 \\ 学习次数', ...studyHeaders],
-          probabilityRows.map(row => [row.memory.label, ...row.cells.map(cell => cell.text)])
-        ))
-        parts.push('\n单元格格式：n/忘/模/认/Easy。')
-      }
-    } else {
-      parts.push('暂无预测数据。')
+      selected += 1
     }
+    if (getCopyDetailEnabled(cardStore, '目标达标与复习概率', 'probability')) {
+      parts.push(buildProbabilityMarkdown(result?.probabilityModel))
+      selected += 1
+    }
+    if (!selected) parts.push('_未勾选目标达标与复习概率复制明细_')
   } else if (copyKey === 'todayWorkspace') {
     parts.push(buildTodayWorkspaceMarkdown(dataStore, cardStore))
   } else if (copyKey === 'wordList') {
-    parts.push(dataStore.wordList?.lastText || '# 单词列表\n\n未查询单词列表。')
+    if (getCopyDetailEnabled(cardStore, '查看单词列表', 'list')) {
+      parts.push(dataStore.wordList?.lastText || '# 单词列表\n\n未查询单词列表。')
+    } else {
+      parts.push('# 单词列表\n\n_未勾选单词列表复制明细_')
+    }
   } else if (copyKey === 'todayWordStats') {
     parts.push(`# 当日单词统计\n`)
     if (getCopyDetailEnabled(cardStore, '当日单词统计', 'snapshots')) {
@@ -694,7 +822,11 @@ export function buildSingleCardMarkdown(copyKey) {
       parts.push('_未勾选当日单词统计复制明细_')
     }
   } else if (copyKey === 'notes') {
-    parts.push(buildFieldNotesMarkdown())
+    if (getCopyDetailEnabled(cardStore, '字段注释', 'notes')) {
+      parts.push(buildFieldNotesMarkdown())
+    } else {
+      parts.push('# 字段说明\n\n_未勾选字段说明复制明细_')
+    }
   }
 
   return parts.join('\n')
@@ -703,24 +835,30 @@ export function buildSingleCardMarkdown(copyKey) {
 export function buildAllMarkdown() {
   const cardStore = useCardStore()
   const rows = getDisplayRows()
-  if (!rows.length) return '# 墨墨历史统计数据\n\n_暂无数据_'
 
-  const copyKeys = new Set(cardStore.getCopyKeys())
+  const selectedCards = cardStore.getCopyableCards()
+    .filter(card => cardStore.copyEnabled[card.id] !== false)
   const now = new Date().toLocaleString('zh-CN', { hour12: false })
   const cleanRows = displayRowsOnly(rows)
   const rangeText = cleanRows.length ? `${cleanRows[0].date} ~ ${cleanRows[cleanRows.length - 1].date}` : '无范围'
   const parts = ['# 墨墨历史统计数据', '', `生成时间：${now}`, `当前范围：${rangeText}`, `显示数据日：${cleanRows.length} 天`, '']
+  const emittedCopyKeys = new Set()
+  let sectionCount = 0
 
-  if (copyKeys.has('overviewChart')) parts.push(buildSingleCardMarkdown('overviewChart'))
-  if (copyKeys.has('summary')) parts.push(buildSingleCardMarkdown('summary'))
-  if (copyKeys.has('todayWordStats')) parts.push(buildSingleCardMarkdown('todayWordStats'))
-  if (copyKeys.has('todayWorkspace')) parts.push(buildSingleCardMarkdown('todayWorkspace'))
-  if (copyKeys.has('studyTime')) parts.push(buildSingleCardMarkdown('studyTime'))
-  if (copyKeys.has('memory')) parts.push(buildSingleCardMarkdown('memory'))
-  if (copyKeys.has('prediction')) parts.push(buildSingleCardMarkdown('prediction'))
-  if (copyKeys.has('predictionTarget')) parts.push(buildSingleCardMarkdown('predictionTarget'))
-  if (copyKeys.has('wordList')) parts.push(buildSingleCardMarkdown('wordList'))
-  if (copyKeys.has('notes')) parts.push(buildSingleCardMarkdown('notes'))
+  for (const card of selectedCards) {
+    const copyKey = card?.copyKey
+    if (!copyKey || emittedCopyKeys.has(copyKey)) continue
+    if (!rows.length && ROW_DEPENDENT_COPY_KEYS.has(copyKey)) continue
+    const markdown = buildSingleCardMarkdown(copyKey)
+    if (!hasUsefulCopyContent(copyKey, markdown)) continue
+    parts.push(markdown)
+    emittedCopyKeys.add(copyKey)
+    sectionCount += 1
+  }
+
+  if (!sectionCount) {
+    parts.push('_未勾选任何可复制内容，或当前选中卡片暂无可复制数据。_')
+  }
 
   return parts.filter(Boolean).join('\n\n')
 }

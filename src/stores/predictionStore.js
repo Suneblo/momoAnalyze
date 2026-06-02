@@ -17,7 +17,7 @@ export const usePredictionStore = defineStore('prediction', () => {
       settings.predictionInitMode,
       settings.predictionRatingKnown + ',' + settings.predictionRatingVague + ',' + settings.predictionRatingForget,
       settings.predictionTargetMetric + '|' + settings.predictionTargetDays + '|' + settings.predictionTargetCount,
-      settings.predictionProbLogBase + ',' + settings.predictionProbBucketSize + ',' + settings.predictionProbStudyCountBucketSize,
+      settings.predictionProbMemoryBucketSize + ',' + settings.predictionProbStudyCountBucketSize,
       settings.predictionUseStudyCountDimension ? '1' : '0',
     ].join('|')
   }

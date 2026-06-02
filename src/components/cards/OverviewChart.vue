@@ -23,6 +23,7 @@
 import { computed, ref } from 'vue'
 import { useDataStore } from '@/stores/dataStore'
 import { useSettingsStore } from '@/stores/settingsStore'
+import { buildDashedGapLineSeries } from '@/utils/chartOptions'
 import BaseChart from '@/components/charts/BaseChart.vue'
 
 defineProps({ card: Object })
@@ -97,16 +98,66 @@ function countDueAt(row, offset) {
   return direct !== undefined && direct !== null ? toNumber(direct) : 0
 }
 
-function actualRows() {
+function makeGapRow(date) {
+  return {
+    date,
+    isGapMarker: true,
+    studyStatus: {
+      today: {
+        known: 0,
+        vague: 0,
+        forget: 0,
+        finished: 0,
+        total: 0,
+        unfinished: 0,
+        reviewDone: 0,
+        reviewPending: 0,
+        reviewTotal: 0,
+        newDone: 0,
+        newPending: 0,
+        newTotal: 0,
+      },
+      overall: {},
+      critical: { dueToday: 0, dueByOffset: {} },
+    },
+  }
+}
+
+function expandCalendarRows(rows) {
+  if (!rows.length) return []
+  const out = []
+  for (let i = 0; i < rows.length; i += 1) {
+    const row = rows[i]
+    if (i > 0) {
+      const prevDate = parseDate(rows[i - 1].date)
+      const currentDate = parseDate(row.date)
+      if (prevDate && currentDate) {
+        for (let cursor = addDays(prevDate, 1); cursor < currentDate; cursor = addDays(cursor, 1)) {
+          out.push(makeGapRow(formatDate(cursor)))
+        }
+      }
+    }
+    out.push(row)
+  }
+  return out
+}
+
+function realRows() {
   return (dataStore.displayRows || [])
     .filter(row => row && !row.isGapMarker && (row.studyStatus?.today || row.hasProgressData || row.hasOverviewData))
+}
+
+function actualRows() {
+  return expandCalendarRows(realRows())
 }
 
 const timeline = computed(() => {
   const rows = actualRows()
   if (!rows.length) return []
 
-  const latest = rows[rows.length - 1]
+  const real = realRows()
+  const latest = real[real.length - 1]
+  if (!latest) return []
   const latestDate = latest.date
   const latestDateObj = parseDate(latestDate)
   const futureDays = Math.max(0, Math.min(365, Number(settings.criticalFutureDays) || 0))
@@ -283,6 +334,10 @@ function cognitionOption(points) {
           if (item.value !== null && item.value !== undefined) text += `${item.marker}${item.seriesName}: ${item.value}<br/>`
         })
         if (point?.type === 'actual') {
+          if (point.row?.isGapMarker) {
+            text += `<span style="color:#999">该日无数据</span>`
+            return text
+          }
           const t = today(point.row)
           const done = toNumber(t.known) + toNumber(t.vague) + toNumber(t.forget)
           text += `<span style="color:#999">已完成: ${done}，总数: ${toNumber(t.total, point.row.total)}</span>`
@@ -368,8 +423,8 @@ const mainChartOption = computed(() => {
 })
 
 const formulaWarning = computed(() => {
-  const rows = actualRows()
-  const latest = rows[rows.length - 1]
+  const real = realRows()
+  const latest = real[real.length - 1]
   const checks = latest?.studyStatus?.checks || {}
   if (!latest || !Object.keys(checks).length) return ''
   if (checks.responseDoneEqualsTaskDone === false) return '数据校验异常：认识+模糊+忘记 与 已复习+已新学 不一致。'
@@ -380,16 +435,23 @@ const formulaWarning = computed(() => {
 const overdueChartOption = computed(() => {
   const rows = actualRows()
   if (!rows.length) return null
-  const labels = rows.map(row => axisLabel(row.date, rows[rows.length - 1]?.date, 0))
+  const real = realRows()
+  const latestRealDate = real[real.length - 1]?.date || rows[rows.length - 1]?.date
+  const labels = rows.map(row => axisLabel(row.date, latestRealDate, 0))
   const dates = rows.map(row => row.date)
-  const data = rows.map(row => toNumber(overall(row).overdue, row['逾期']))
+  const data = rows.map(row => row.isGapMarker ? null : toNumber(overall(row).overdue, row['逾期']))
+  const color = '#ef4444'
 
   return {
     tooltip: {
       trigger: 'axis',
       formatter: params => {
         const index = params[0]?.dataIndex ?? 0
-        return `<b>${dates[index] || labels[index]}</b><br/>${params[0].marker}逾期: ${params[0].value}`
+        const value = params[0]?.value
+        if (value === null || value === undefined) {
+          return `<b>${dates[index] || labels[index]}</b><br/><span style="color:#999">该日无数据，折线以虚线跨过。</span>`
+        }
+        return `<b>${dates[index] || labels[index]}</b><br/>${params[0].marker}逾期: ${value}`
       },
     },
     grid: { left: 52, right: 22, top: 18, bottom: 35 },
@@ -406,9 +468,11 @@ const overdueChartOption = computed(() => {
         smooth: false,
         symbol: rows.length > 45 ? 'none' : 'circle',
         data,
-        lineStyle: { width: 2, color: '#ef4444' },
-        itemStyle: { color: '#ef4444' },
+        connectNulls: false,
+        lineStyle: { width: 2, color },
+        itemStyle: { color },
       },
+      ...buildDashedGapLineSeries(data, color, { name: '逾期', width: 2 }),
     ],
   }
 })

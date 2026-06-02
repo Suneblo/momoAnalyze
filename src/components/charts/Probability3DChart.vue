@@ -6,10 +6,12 @@
 
 <script setup>
 import { computed, inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { buildProbabilityTableRows } from '@/utils/dashboardPrediction'
 
 const props = defineProps({
   model: { type: Object, default: null },
   rating: { type: String, default: 'good' },
+  ratings: { type: Array, default: () => [] },
   height: { type: Number, default: 460 },
 })
 
@@ -39,14 +41,17 @@ const currentZoom = computed(() => {
 
 const scaledHeight = computed(() => Math.max(280, Math.round((Number(props.height) || 460) * currentZoom.value)))
 
-function mapValue(maybeMap, key) {
-  if (!maybeMap) return undefined
-  if (typeof maybeMap.get === 'function') return maybeMap.get(key)
-  return maybeMap[key]
-}
-
 function ratingLabel(rating) {
   return { again: '忘记', hard: '模糊', good: '认识', easy: 'Easy' }[rating] || rating
+}
+
+function activeRatings() {
+  const selected = Array.isArray(props.ratings) && props.ratings.length ? props.ratings : [props.rating]
+  return selected.filter(rating => ['again', 'hard', 'good', 'easy'].includes(String(rating)))
+}
+
+function ratingsLabel(ratings) {
+  return ratings.map(ratingLabel).join('+') || '认识'
 }
 
 function cellProbability(cell, rating) {
@@ -64,51 +69,78 @@ function pct(cell, rating) {
   return Math.round(cellProbability(cell, rating) * 1000) / 10
 }
 
-function cellSource(cell) {
-  if (!cell) return '-'
-  if (cell.fallbackMethod === 'self' || cell.usedNearestFallback === false) return '本分桶'
-  if (cell.fallbackMethod === 'diffusion-fill') return `真实格子扩散估计${cell.diffusionRadius ? `（${Math.round(Number(cell.diffusionRadius))}圈）` : ''}`
-  if (cell.fallbackMethod === 'memoryFallback') return '同记忆持久度分桶估计'
-  if (cell.fallbackMethod === 'globalFallback') return '全局概率估计'
-  if (cell.fallbackMethod === 'noData') return '无数据格子'
-  return cell.fallbackMethod || '-'
+function combinedPct(cell, ratings) {
+  const value = ratings.reduce((sum, rating) => sum + cellProbability(cell, rating), 0)
+  return Math.round(Math.max(0, Math.min(1, value)) * 1000) / 10
 }
 
 function buildPlotData() {
   const model = props.model
   const memoryBuckets = model?.memoryBuckets || []
-  const studyBuckets = model?.studyBuckets || []
+  const tableRows = buildProbabilityTableRows(model)
+  const studyBuckets = tableRows.studyRows || model?.studyBuckets || []
   if (!model || !memoryBuckets.length || !studyBuckets.length) return null
 
-  const x = studyBuckets.map(item => item.label)
-  const y = memoryBuckets.map(item => item.label)
-  const z = []
-  const customdata = []
-  const rating = props.rating
-  const label = ratingLabel(rating)
+  const x = studyBuckets.map((_, index) => index)
+  const y = memoryBuckets.map((_, index) => index)
+  const xLabels = studyBuckets.map(item => item.label)
+  const yLabels = memoryBuckets.map(item => item.label)
+  const z = memoryBuckets.map(() => studyBuckets.map(() => null))
+  const hovertext = memoryBuckets.map(() => studyBuckets.map(() => ''))
+  const ratings = activeRatings()
+  const label = ratingsLabel(ratings)
+  const probabilityValues = []
 
-  for (const memory of memoryBuckets) {
-    const row = []
-    const customRow = []
-    for (const study of studyBuckets) {
-      const cell = mapValue(model.byKey, `${memory.key}|${study.key}`)
-      const value = pct(cell, rating)
-      row.push(value)
-      const n = Number(cell?.n || cell?.total || 0)
-      customRow.push([
-        `记忆持久度：${memory.label}`,
-        `学习次数：${study.label}`,
-        `当前 ${label}：${value.toFixed(1)}%`,
+  tableRows.forEach((row, rowIndex) => {
+    row.cells.forEach((cell, colIndex) => {
+      if (!cell || cell.skip || cell.insufficient) return
+      const raw = cell.raw || cell
+      const n = Number(raw?.n || raw?.total || 0)
+      if (!Number.isFinite(n) || n <= 0) return
+      const value = combinedPct(raw, ratings)
+      if (Number.isFinite(value)) probabilityValues.push(value)
+      const text = [
+        `记忆持久度：${cell.memoryRangeLabel || row.memory?.label || yLabels[rowIndex]}`,
+        `学习次数：${cell.label || xLabels[colIndex]}`,
+        `当前 ${label}合并概率：${value.toFixed(1)}%`,
         `n：${Number.isFinite(n) ? Math.round(n) : 0}`,
-        `忘/模/认/Easy：${pct(cell, 'again').toFixed(1)} / ${pct(cell, 'hard').toFixed(1)} / ${pct(cell, 'good').toFixed(1)} / ${pct(cell, 'easy').toFixed(1)}%`,
-        `来源：${cellSource(cell)}`,
-      ].join('<br>'))
-    }
-    z.push(row)
-    customdata.push(customRow)
+        `忘/模/认/Easy：${pct(raw, 'again').toFixed(1)} / ${pct(raw, 'hard').toFixed(1)} / ${pct(raw, 'good').toFixed(1)} / ${pct(raw, 'easy').toFixed(1)}%`,
+        cell.rowspan > 1 ? `区域：向下合并 ${cell.rowspan} 个记忆持久度桶` : '区域：单格',
+      ].join('<br>')
+      for (let offset = 0; offset < Math.max(1, Number(cell.rowspan) || 1); offset += 1) {
+        const yIndex = rowIndex + offset
+        if (!z[yIndex]) continue
+        z[yIndex][colIndex] = value
+        hovertext[yIndex][colIndex] = text
+      }
+    })
+  })
+
+  const probabilityMin = probabilityValues.length ? Math.min(...probabilityValues) : 0
+  const probabilityMax = probabilityValues.length ? Math.max(...probabilityValues) : 100
+  const rangePad = probabilityMin === probabilityMax ? Math.max(0.5, Math.abs(probabilityMin) * 0.04) : 0
+  const probabilityRange = [
+    Math.max(0, probabilityMin - rangePad),
+    Math.min(100, probabilityMax + rangePad),
+  ]
+  if (probabilityRange[0] === probabilityRange[1]) {
+    probabilityRange[0] = Math.max(0, probabilityRange[0] - 0.5)
+    probabilityRange[1] = Math.min(100, probabilityRange[1] + 0.5)
   }
 
-  return { x, y, z, customdata, label, sampleCount: model.reviewSampleCount || model.globalCounts?.n || 0 }
+  return {
+    x,
+    y,
+    xLabels,
+    yLabels,
+    z,
+    hovertext,
+    label,
+    probabilityMin,
+    probabilityMax,
+    probabilityRange,
+    sampleCount: model.reviewSampleCount || model.globalCounts?.n || 0,
+  }
 }
 
 async function ensurePlotly() {
@@ -137,6 +169,9 @@ function makeLayout(data) {
       xaxis: {
         title: { text: '学习次数', font: { size: fontSize } },
         tickfont: { size: axisFontSize },
+        tickmode: 'array',
+        tickvals: data.x,
+        ticktext: data.xLabels,
         backgroundcolor: 'rgba(248,250,252,.75)',
         gridcolor: 'rgba(148,163,184,.32)',
         zerolinecolor: 'rgba(148,163,184,.45)',
@@ -144,20 +179,23 @@ function makeLayout(data) {
       yaxis: {
         title: { text: '记忆持久度', font: { size: fontSize } },
         tickfont: { size: axisFontSize },
+        tickmode: 'array',
+        tickvals: data.y,
+        ticktext: data.yLabels,
         backgroundcolor: 'rgba(248,250,252,.75)',
         gridcolor: 'rgba(148,163,184,.32)',
         zerolinecolor: 'rgba(148,163,184,.45)',
       },
       zaxis: {
-        title: { text: `${data.label}%`, font: { size: fontSize } },
+        title: { text: `${data.label}% / n`, font: { size: fontSize } },
         tickfont: { size: axisFontSize },
-        range: [0, 100],
+        range: data.probabilityRange,
         backgroundcolor: 'rgba(248,250,252,.55)',
         gridcolor: 'rgba(148,163,184,.32)',
         zerolinecolor: 'rgba(148,163,184,.45)',
       },
       camera: {
-        eye: { x: 1.7, y: 1.65, z: 0.82 },
+        eye: { x: -1.7, y: -1.65, z: 0.82 },
       },
       aspectratio: { x: 1.45, y: 1.05, z: 0.62 },
     },
@@ -170,11 +208,12 @@ function makeTrace(data) {
     x: data.x,
     y: data.y,
     z: data.z,
-    customdata: data.customdata,
-    hovertemplate: '%{customdata}<extra></extra>',
+    hovertext: data.hovertext,
+    hoverinfo: 'text',
+    connectgaps: false,
     colorscale: 'Blues',
-    cmin: 0,
-    cmax: 100,
+    cmin: data.probabilityRange[0],
+    cmax: data.probabilityRange[1],
     opacity: 0.92,
     contours: {
       z: {
@@ -187,7 +226,7 @@ function makeTrace(data) {
       y: { show: true, color: 'rgba(37,99,235,.22)' },
     },
     colorbar: {
-      title: `${data.label}%`,
+      title: `${data.label}% / n`,
       titleside: 'top',
       len: 0.74,
       thickness: Math.max(10, Math.round(14 * currentZoom.value)),
@@ -214,7 +253,7 @@ function resizePlot() {
   if (Plotly && plotRef.value) Plotly.Plots.resize(plotRef.value)
 }
 
-watch(() => [props.model, props.rating, currentZoom.value, scaledHeight.value], () => nextTick(renderPlot), { deep: true })
+watch(() => [props.model, props.rating, props.ratings, currentZoom.value, scaledHeight.value], () => nextTick(renderPlot), { deep: true })
 
 onMounted(() => {
   nextTick(renderPlot)

@@ -457,6 +457,13 @@ def canonical_spelling(obj: dict[str, Any] | None) -> str | None:
 
 def canonical_word_key(obj: dict[str, Any] | None) -> str | None:
     """本地分析使用 spelling 作为单词键；空 spelling 时仅用 voc_id 兜底。"""
+    if isinstance(obj, dict):
+        explicit = obj.get("word_key")
+        if explicit not in (None, ""):
+            text = str(explicit).strip()
+            if text:
+                return text
+
     spelling = canonical_spelling(obj)
     if spelling:
         return spelling
@@ -725,6 +732,52 @@ def _study_status_critical_from_records(records: list[dict[str, Any]], day_key: 
     }
 
 
+def _study_status_critical_from_today_items(today_items: list[dict[str, Any]], day_key: str) -> dict[str, Any] | None:
+    """Compute time-point critical counts from the current study task list.
+
+    For an unfinished review item, the item is still waiting at its previous due
+    date. For a finished item, the current next study date is already the
+    post-review due date. This keeps intra-day snapshots from all showing the
+    final overview critical count.
+    """
+    due_by_offset: dict[str, int] = {}
+    due_today_count = 0
+    seen = 0
+
+    for item in today_items:
+        if item.get("present_state") == "confirmed_absent":
+            continue
+        if item.get("is_new") is True:
+            continue
+
+        if item.get("is_finished") is True:
+            due_date = item.get("next_study_date") or item.get("nextStudyDate")
+        else:
+            due_date = (
+                item.get("previous_next_study_date")
+                or item.get("previousNextStudyDate")
+                or item.get("next_study_date")
+                or item.get("nextStudyDate")
+            )
+
+        days = _date_diff_days(due_date, f"{day_key}T12:00:00+08:00")
+        if days is None:
+            continue
+
+        seen += 1
+        rounded = int(round(days))
+        due_by_offset[str(rounded)] = due_by_offset.get(str(rounded), 0) + 1
+        if days <= 0:
+            due_today_count += 1
+
+    if not seen:
+        return None
+    return {
+        "dueToday": due_today_count,
+        "dueByOffset": due_by_offset,
+    }
+
+
 def build_study_status_from_raw(day: str, records: list[dict[str, Any]], today_items: list[dict[str, Any]], progress_row: sqlite3.Row | dict[str, Any] | None, snapshot_time_value: str | None = None) -> dict[str, Any]:
     """Build the canonical study-status API from raw reconstructed data.
 
@@ -805,7 +858,7 @@ def build_study_status_from_raw(day: str, records: list[dict[str, Any]], today_i
         "capturedAt": snapshot,
         "today": today,
         "overall": _study_status_overall_from_records(records, day),
-        "critical": _study_status_critical_from_records(records, day),
+        "critical": _study_status_critical_from_today_items(active, day) or _study_status_critical_from_records(records, day),
         "checks": checks,
         "dbSnapshot": {
             "finished": row_finished,
@@ -836,6 +889,7 @@ class ImportResult:
     inserted_records: int
     today_item_changes: int = 0
     overview_changes: int = 0
+    custom_word_stats: dict[str, int] | None = None
 
 
 def _date_only(value: str | None) -> str:

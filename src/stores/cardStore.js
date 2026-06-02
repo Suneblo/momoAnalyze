@@ -25,6 +25,7 @@ export const CARD_REGISTRY = [
   { id: '当日单词统计', page: 'today', copyKey: 'todayWordStats', copyDetail: { snapshots: '快照实时数据' } },
   { id: '当日时间点查看', page: 'today', copyKey: 'todayWorkspace', copyDetail: { summary: '时间点列表', latest: '最近时间点明细', compare: '最近两个时间点对比' } },
   { id: '数据减少提醒', page: 'today', copyKey: 'dataAlert', copyEnabled: false },
+  { id: '自定义词', page: 'today', copyKey: 'customWords', copyEnabled: false },
 
   { id: '记忆持久度统计', page: 'study', copyKey: 'memory', copyDetail: { chart: '图表数据' } },
   { id: '每日学习时长统计', page: 'study', copyKey: 'studyTime', copyDetail: { chart: '图表数据', summary: '汇总统计' } },
@@ -122,7 +123,7 @@ export const useCardStore = defineStore('card', () => {
 
 
       // 工具卡只用于显示，不参与总复制；当日时间点查看已支持复制，保留为可复制卡片。
-      for (const id of ['云词本管理器', '文章生词筛选', '数据减少提醒']) {
+      for (const id of ['云词本管理器', '文章生词筛选', '数据减少提醒', '自定义词']) {
         copyEnabled[id] = false
       }
 
@@ -197,6 +198,36 @@ export const useCardStore = defineStore('card', () => {
     save()
   }
 
+  function reorderCardsInPage(pageKey, pageIds) {
+    const validPageIds = getOrderedCards(pageKey).map(card => card.id)
+    if (!validPageIds.length) return
+
+    const nextPageIds = []
+    for (const id of Array.isArray(pageIds) ? pageIds : []) {
+      if (validPageIds.includes(id) && !nextPageIds.includes(id)) nextPageIds.push(id)
+    }
+    for (const id of validPageIds) {
+      if (!nextPageIds.includes(id)) nextPageIds.push(id)
+    }
+
+    if (pageKey === 'today' && nextPageIds.includes(FIXED_FIRST_CARD_ID)) {
+      nextPageIds.splice(nextPageIds.indexOf(FIXED_FIRST_CARD_ID), 1)
+      nextPageIds.unshift(FIXED_FIRST_CARD_ID)
+    }
+
+    const nextOrder = []
+    for (const page of PAGE_REGISTRY) {
+      if (page.key === pageKey) {
+        nextOrder.push(...nextPageIds)
+      } else {
+        nextOrder.push(...getOrderedCards(page.key).map(card => card.id))
+      }
+    }
+
+    order.value = normalizeOrder(nextOrder)
+    save()
+  }
+
   function moveCard(idx, dir) {
     const card = getCardById(order.value[idx])
     if (!card) return
@@ -211,7 +242,7 @@ export const useCardStore = defineStore('card', () => {
 
   return {
     order, visible, copyEnabled, copyDetail,
-    load, save, moveCard, moveCardInPage,
+    load, save, moveCard, moveCardInPage, reorderCardsInPage,
     getCardsByPage, getOrderedCards, getVisibleCards, getCopyableCards, getCopyKeys
   }
 })

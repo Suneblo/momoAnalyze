@@ -1,6 +1,6 @@
 <template>
   <div class="container">
-    <HeaderCard @reload="reloadData" @copy-all="copyAll" @sync="syncNow" />
+    <HeaderCard @reload="reloadData" @copy-all="copyAll" @copy-latest-diff="copyLatestTimepointDiff" @sync="syncNow" />
     <LogCard ref="logRef" />
 
     <nav class="page-tabs" aria-label="页面切换">
@@ -51,6 +51,7 @@
 
 <script setup>
 import { computed, ref, onMounted, onBeforeUnmount, provide } from 'vue'
+import { ElMessageBox } from 'element-plus'
 import { useSettingsStore } from './stores/settingsStore'
 import { useCardStore, PAGE_REGISTRY } from './stores/cardStore'
 import { useDataStore } from './stores/dataStore'
@@ -72,6 +73,7 @@ const pages = PAGE_REGISTRY
 const activePage = ref('today')
 const isUpdating = ref(false)
 const isReloading = ref(false)
+const isCopyingLatestDiff = ref(false)
 const ZOOM_STORAGE_KEY = 'momo-global-zoom'
 const FLOATING_PANEL_STORAGE_KEY = 'momo-floating-panel-positions'
 const globalZoom = ref(readSavedZoom())
@@ -251,13 +253,37 @@ onBeforeUnmount(() => {
   window.removeEventListener('pointermove', onPanelDragMove)
 })
 
-async function reloadData() {
+async function reloadData(options = {}) {
+  const promptTodayEmpty = options?.promptTodayEmpty !== false
   isReloading.value = true
   try {
     const data = await api.fetchDashboardPage(0, 60, 'asc', { memoryThresholds: settings.memoryThresholds })
     if (data?.days) {
       dataStore.setDashboardData(data)
       log(`加载完成：扫描 ${data.total || 0} 天，当前范围 ${dataStore.renderMeta.start || '-'} ~ ${dataStore.renderMeta.end || '-'}，显示 ${dataStore.renderMeta.dataDays || 0} 天`)
+    }
+
+    const workspaceData = await api.fetchTodayWorkspace()
+    if (workspaceData?.todayWorkspace) {
+      dataStore.setTodayWorkspace(workspaceData.todayWorkspace)
+      const snapshotCount = workspaceData.todayWorkspace.snapshots?.length || 0
+      log(`当日时间点已加载：${workspaceData.todayWorkspace.date || '-'}，快照 ${snapshotCount} 个`)
+      if (!snapshotCount && promptTodayEmpty && !isUpdating.value) {
+        try {
+          await ElMessageBox.confirm(
+            '今日暂无数据库快照，是否立即联网获取最新数据？',
+            '今日暂无数据',
+            {
+              confirmButtonText: '获取最新数据',
+              cancelButtonText: '暂不获取',
+              type: 'warning',
+            },
+          )
+          await syncNow()
+        } catch {
+          log('今日暂无数据，已暂不联网获取')
+        }
+      }
     }
 
     const alertData = await api.fetchAlerts()
@@ -275,6 +301,49 @@ async function copyAll() {
   log('已复制全部选中内容')
 }
 
+const TIMEPOINT_DIFF_COPY_KEYS = new Set(['overviewChart', 'todayWordStats', 'todayWorkspace', 'summary', 'memory', 'studyTime'])
+
+function timepointCopyDetails() {
+  return {
+    overviewChart: { ...(cardStore.copyDetail['复习情况'] || {}) },
+    todayWordStats: { ...(cardStore.copyDetail['当日单词统计'] || {}) },
+    todayWorkspace: { ...(cardStore.copyDetail['当日时间点查看'] || {}) },
+    summary: { ...(cardStore.copyDetail['按日期统计表'] || {}) },
+    memory: { ...(cardStore.copyDetail['记忆持久度统计'] || {}) },
+    studyTime: { ...(cardStore.copyDetail['每日学习时长统计'] || {}) },
+  }
+}
+
+async function copyLatestTimepointDiff() {
+  if (isCopyingLatestDiff.value) return
+  const copyKeys = cardStore.getCopyKeys().filter(key => TIMEPOINT_DIFF_COPY_KEYS.has(key))
+  if (!copyKeys.length) {
+    log('最近时间点变化复制失败：总复制里没有勾选可对比时间点变化的卡片')
+    return
+  }
+  isCopyingLatestDiff.value = true
+  log('正在生成最近时间点变化...')
+  try {
+    const data = await api.fetchTimepointDiff({
+      memoryThresholds: settings.memoryThresholds,
+      criticalFutureDays: settings.criticalFutureDays,
+      copyKeys,
+      copyDetails: timepointCopyDetails(),
+    })
+    const diff = data?.diff
+    if (!data?.success || diff?.available === false || !diff?.copyText) {
+      log('最近时间点变化复制失败：' + (diff?.error || data?.error || '总复制选中的卡片没有可复制变化；如数据未加载，请先重新加载或联网获取最新数据'))
+      return
+    }
+    await copyToClipboard(diff.copyText)
+    log(`已复制最近时间点变化：${diff.displayA || diff.snapshotA || '-'} -> ${diff.displayB || diff.snapshotB || '-'}`)
+  } catch (e) {
+    log('最近时间点变化复制失败：' + (e.message || e))
+  } finally {
+    isCopyingLatestDiff.value = false
+  }
+}
+
 async function syncNow() {
   if (isUpdating.value) return
   isUpdating.value = true
@@ -283,7 +352,7 @@ async function syncNow() {
     const result = await api.syncFromApi()
     if (result?.success) {
       log('联网同步完成，正在刷新...')
-      await reloadData()
+      await reloadData({ promptTodayEmpty: false })
     } else {
       log('联网同步失败：' + (result?.error || '未知错误'))
     }

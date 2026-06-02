@@ -10,6 +10,43 @@ export const COLORS = {
   teal: '#14b8a6'
 }
 
+function hasLinePointValue(point) {
+  const value = Array.isArray(point) ? point[1] : point
+  return value !== null && value !== undefined && Number.isFinite(Number(value))
+}
+
+export function buildDashedGapLineSeries(data, color, opts = {}) {
+  const out = []
+  let previousRealIndex = -1
+  const width = Number(opts.width || 2)
+
+  ;(data || []).forEach((point, index) => {
+    if (!hasLinePointValue(point)) return
+    if (previousRealIndex >= 0 && index - previousRealIndex > 1) {
+      const segment = new Array(data.length).fill(null)
+      segment[previousRealIndex] = data[previousRealIndex]
+      segment[index] = point
+      out.push({
+        name: opts.name ? `${opts.name} 无数据连接` : '无数据连接',
+        type: 'line',
+        data: segment,
+        smooth: false,
+        connectNulls: true,
+        symbol: 'none',
+        silent: true,
+        tooltip: { show: false },
+        lineStyle: { color, width, type: 'dashed', opacity: 0.75 },
+        itemStyle: { color },
+        emphasis: { disabled: true },
+        z: opts.z ?? 1,
+      })
+    }
+    previousRealIndex = index
+  })
+
+  return out
+}
+
 /**
  * Build a multi-series line chart option
  * @param {string[]} labels - X-axis labels
@@ -40,16 +77,17 @@ export function buildLineOption(labels, seriesList, opts = {}) {
       name: opts.yUnit || '',
       minInterval: 1
     },
-    series: seriesList.map(s => ({
+    series: seriesList.flatMap(s => [{
       name: s.name,
       type: 'line',
       data: s.data,
       smooth: false,
+      connectNulls: false,
       itemStyle: { color: s.color },
       lineStyle: { color: s.color, width: 2 },
       symbol: 'circle',
       symbolSize: 6
-    }))
+    }, ...(opts.dashedGaps ? buildDashedGapLineSeries(s.data, s.color, { name: s.name, width: 2 }) : [])])
   }
 }
 

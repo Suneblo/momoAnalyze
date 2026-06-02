@@ -1,0 +1,51 @@
+{
+  "server": {
+    "backend": {
+      "host": "127.0.0.1",
+      "port": 8000
+    },
+    "frontend": {
+      "host": "0.0.0.0",
+      "port": 5173
+    }
+  },
+  "paths": {
+    "database": "data/momo.sqlite",
+    "token": "token.txt"
+  },
+  "sync": {
+    "cooldownMinutes": 0
+  },
+  "memoryAlgorithm": {
+    "algorithm": "fsrs",
+    "enabled": true,
+    "desiredRetention": 0.9,
+    "maximumIntervalDays": 36500,
+    "enableFuzzing": false,
+    "learningStepsMinutes": [
+      1,
+      10
+    ],
+    "relearningStepsMinutes": [
+      10
+    ],
+    "lowHistoryReviewThreshold": 5,
+    "ratingMapping": {
+      "忘记": "Again",
+      "模糊": "Hard",
+      "认识": "Good",
+      "FORGET": "Again",
+      "VAGUE": "Hard",
+      "FAMILIAR": "Good"
+    },
+    "prediction": {
+      "maxWordRows": 2000,
+      "tablePreviewRows": 50,
+      "defaultDays": 30,
+      "historyCoverageFullThreshold": 0.8,
+      "historyCoveragePartialThreshold": 0.3,
+      "minFsrsHistoryEvents": 2,
+      "reviewIndexMode": "observed"
+    }
+  }
+}

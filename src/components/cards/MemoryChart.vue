@@ -34,6 +34,7 @@ import {
   getReviewSpanThresholds,
   sortRowsByDateAsc,
 } from '@/utils/memoryThresholds'
+import { buildDashedGapLineSeries } from '@/utils/chartOptions'
 import BaseChart from '@/components/charts/BaseChart.vue'
 
 defineProps({ card: Object })
@@ -41,23 +42,31 @@ const dataStore = useDataStore()
 const settings = useSettingsStore()
 
 const rows = computed(() => sortRowsByDateAsc(dataStore.displayRows)
-  .filter(row => row.hasOverviewData && !row.isGapMarker))
+  .filter(row => row?.date && (row.hasOverviewData || row.isGapMarker || row.hasData === false)))
 
 function makeLineChart(title, thresholds, counter) {
   const cleanRows = rows.value
-  if (!cleanRows.length || !thresholds.length) return null
+  const realRows = cleanRows.filter(row => row.hasOverviewData && !row.isGapMarker)
+  if (!realRows.length || !thresholds.length) return null
 
   const labels = cleanRows.map(row => row.date?.slice(5) || '')
-  const series = thresholds.map((spec, index) => ({
-    name: spec.headerLabel,
-    type: 'line',
-    data: cleanRows.map(row => counter(row, spec)),
-    smooth: false,
-    connectNulls: false,
-    symbol: 'none',
-    lineStyle: { width: 2, color: MEMORY_SERIES_COLORS[index % MEMORY_SERIES_COLORS.length] },
-    itemStyle: { color: MEMORY_SERIES_COLORS[index % MEMORY_SERIES_COLORS.length] },
-  }))
+  const series = thresholds.flatMap((spec, index) => {
+    const color = MEMORY_SERIES_COLORS[index % MEMORY_SERIES_COLORS.length]
+    const data = cleanRows.map(row => row.hasOverviewData && !row.isGapMarker ? counter(row, spec) : null)
+    return [
+      {
+        name: spec.headerLabel,
+        type: 'line',
+        data,
+        smooth: false,
+        connectNulls: false,
+        symbol: 'none',
+        lineStyle: { width: 2, color },
+        itemStyle: { color },
+      },
+      ...buildDashedGapLineSeries(data, color, { name: spec.headerLabel, width: 2 }),
+    ]
+  })
 
   return {
     __pointBaseWidth: 52,
@@ -67,14 +76,19 @@ function makeLineChart(title, thresholds, counter) {
         const index = params[0]?.dataIndex ?? 0
         const fullDate = cleanRows[index]?.date || params[0]?.axisValue || ''
         let html = `<b>${fullDate}</b><br/>`
+        if (cleanRows[index]?.isGapMarker || cleanRows[index]?.hasOverviewData === false) {
+          html += `<span style="color:#999">该日无总览数据，折线以虚线跨过。</span><br/>`
+        }
         params.forEach(param => {
-          html += `${param.marker}${param.seriesName}: ${param.value}<br/>`
+          if (param.value !== null && param.value !== undefined) {
+            html += `${param.marker}${param.seriesName}: ${param.value}<br/>`
+          }
         })
         return html
       },
     },
     legend: {
-      data: series.map(item => item.name),
+      data: thresholds.map(item => item.headerLabel),
       bottom: 0,
       type: 'scroll',
       textStyle: { fontSize: 11 },

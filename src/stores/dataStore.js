@@ -18,6 +18,23 @@ function pick(...values) {
   return undefined
 }
 
+function normalizeTodayWorkspace(value) {
+  const payload = value && typeof value === 'object' ? value : {}
+  const snapshots = Array.isArray(payload.snapshots)
+    ? payload.snapshots
+    : Array.isArray(payload.snaps)
+      ? payload.snaps
+      : []
+  return {
+    date: payload.date || '',
+    snapshots,
+    allProgressText: payload.allProgressText || '',
+    error: payload.error || '',
+    ...payload,
+    snapshots,
+  }
+}
+
 
 function normalizeStudyStatus(day, row) {
   const raw = day.studyStatus
@@ -83,6 +100,7 @@ export const useDataStore = defineStore('data', () => {
   const rawRows = ref([])
   const displayRows = ref([])
   const todayWorkspace = ref({ date: '', snapshots: [], allProgressText: '', error: '' })
+  const selectedTodaySnapshotName = ref('')
   const alerts = ref([])
   const renderMeta = ref({ start: '', end: '', scanned: 0, dataDays: 0 })
   const wordList = ref({ items: [], total: 0, page: 1, date: '' })
@@ -151,7 +169,7 @@ export const useDataStore = defineStore('data', () => {
       }))
       computeDisplayRows()
     }
-    if (data.todayWorkspace) todayWorkspace.value = data.todayWorkspace
+    if (data.todayWorkspace) todayWorkspace.value = normalizeTodayWorkspace(data.todayWorkspace)
     if (data.alerts) alerts.value = data.alerts
   }
 
@@ -164,12 +182,21 @@ export const useDataStore = defineStore('data', () => {
   }
 
   function setTodayWorkspace(value) {
-    todayWorkspace.value = value || { date: '', snapshots: [], allProgressText: '', error: '' }
+    todayWorkspace.value = normalizeTodayWorkspace(value)
+    const snapshots = todayWorkspace.value.snapshots || []
+    if (!snapshots.some(snapshot => snapshot?.name === selectedTodaySnapshotName.value)) {
+      selectedTodaySnapshotName.value = snapshots[snapshots.length - 1]?.name || ''
+    }
+  }
+
+  function setSelectedTodaySnapshotName(value) {
+    selectedTodaySnapshotName.value = String(value || '')
   }
 
   return {
-    rawRows, displayRows, todayWorkspace, alerts, renderMeta,
+    rawRows, displayRows, todayWorkspace, selectedTodaySnapshotName, alerts, renderMeta,
     wordList, loaded,
     setDashboardData, refreshDisplayRows, setAlerts, setTodayWorkspace,
+    setSelectedTodaySnapshotName,
   }
 })

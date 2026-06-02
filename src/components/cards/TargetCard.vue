@@ -14,7 +14,7 @@
     <BaseChart v-if="targetChartOption" :option="targetChartOption" :height="300" />
 
     <p class="info-text">
-      复习概率模型：按全局历史中“记忆持久度 × 学习次数 → 再次复习首次反应”统计，对数分桶后供预测模拟抽样；分桶按整数天左闭右闭，例如 1-1天、2-3天、4-7天；概率表的 n 只显示真实样本数；有真实行列支撑的空格会显示 0*、0** 等扩散概率，* 数量表示距离真实格子的扩散轮数；整行或整列无真实样本时不扩散。新词不参与建模分桶，模拟时默认进入次日复习。
+      复习概率模型：按全局历史中“记忆持久度 × 学习次数 → 再次复习首次反应”统计；记忆持久度按固定目标词数分桶，相同天数会整组保留在同一桶里，不会为了凑词数拆开。新词不参与复习概率分桶，模拟时默认进入次日复习。
     </p>
 
     <BaseChart v-if="probabilityChartOption" :option="probabilityChartOption" :height="300" />
@@ -23,18 +23,17 @@
       <div class="probability-3d-head">
         <div>
           <h3>复习概率三维图</h3>
-          <p class="info-text">X 轴为学习次数分桶，Y 轴为记忆持久度分桶，Z 轴为所选反应概率；拖动可旋转，滚轮或双指可缩放。</p>
+          <p class="info-text">X 轴为学习次数分桶，Y 轴为记忆持久度分桶，Z 轴为所选反应合并概率；悬浮信息包含该区域样本数 n。拖动可旋转，滚轮或双指可缩放。</p>
         </div>
-        <label>显示
-          <select v-model="probability3dRating">
-            <option value="again">忘</option>
-            <option value="hard">模</option>
-            <option value="good">认</option>
-            <option value="easy">Easy</option>
-          </select>
-        </label>
+        <div class="probability-rating-checks">
+          <span>显示</span>
+          <label v-for="item in probability3dRatingOptions" :key="item.key">
+            <input :checked="probability3dRatings.includes(item.key)" type="checkbox" @change="toggleProbability3dRating(item.key, $event.target.checked)">
+            {{ item.label }}
+          </label>
+        </div>
       </div>
-      <Probability3DChart :model="probabilityModel" :rating="probability3dRating" :height="480" />
+      <Probability3DChart :model="probabilityModel" :ratings="probability3dRatings" :height="480" />
       <p class="info-text probability-3d-summary">{{ probability3dSummary }}</p>
     </div>
     <p v-else-if="probabilityModel && probabilityModel.useStudyCountDimension === false" class="info-text">学习次数维度已关闭：三维图不显示，概率模型只按记忆持久度一维估计。</p>
@@ -50,11 +49,13 @@
         <tbody>
           <tr v-for="row in probabilityRows" :key="row.memory.key">
             <th>{{ row.memory.label }}</th>
-            <td v-for="cell in row.cells" :key="cell.key" :class="cell.className" :title="cell.title">{{ cell.text }}</td>
+            <template v-for="cell in row.cells" :key="cell.key">
+              <td v-if="!cell.skip" :rowspan="cell.rowspan" :title="cell.title">{{ cell.text }}</td>
+            </template>
           </tr>
         </tbody>
       </table>
-      <div class="info-text table-note">单元格说明：n/忘/模/认/Easy，例如 20/10/25/55/10 表示真实样本 20 个；0* 表示本格真实样本为 0，但概率由距离 1 的真实格子扩散估计，0** 表示距离 2。深灰色表示无数据格子，所在行或列没有真实样本支撑，不扩散；灰色表示数据不足，包括扩散格或低样本格。</div>
+      <div class="info-text table-note">单元格说明：n/忘/模/认/Easy，例如 20/10/25/55/10 表示该区域真实样本 20 个；样本不足时会在同一学习次数列向下合并记忆持久度行，仍不足目标词数则显示 -；空白表示被上方合并区域覆盖。</div>
     </div>
     <p v-else class="info-text">暂无复习概率分桶数据。请先运行“未来每日学习量预测”。</p>
   </div>
@@ -73,7 +74,13 @@ defineProps({ card: Object })
 
 const settings = useSettingsStore()
 const prediction = usePredictionStore()
-const probability3dRating = ref('good')
+const probability3dRatings = ref(['good'])
+const probability3dRatingOptions = [
+  { key: 'again', label: '忘' },
+  { key: 'hard', label: '模' },
+  { key: 'good', label: '认' },
+  { key: 'easy', label: 'Easy' },
+]
 
 const targetChartOption = computed(() => {
   const rows = prediction.result?.rows || []
@@ -99,7 +106,7 @@ const probabilityStudyColumns = computed(() => {
   const model = probabilityModel.value
   if (!model) return []
   if (model.useStudyCountDimension === false) return [{ key: 'all', label: '全部' }]
-  return model.studyBuckets || []
+  return probabilityRows.value.studyRows || model.studyBuckets || []
 })
 
 const probabilityChartOption = computed(() => {
@@ -131,9 +138,19 @@ const probability3dSummary = computed(() => {
   const memoryCount = (model.memoryBuckets || []).length
   const studyCount = (model.studyBuckets || []).length
   const sampleCount = model.reviewSampleCount || model.globalCounts?.n || 0
-  const label = { again: '忘记', hard: '模糊', good: '认识', easy: 'Easy' }[probability3dRating.value] || probability3dRating.value
-  return `当前显示：${label}概率；拖动可旋转，滚轮或双指可缩放；${memoryCount} 个记忆持久度桶 × ${studyCount} 个学习次数桶；复习样本 ${sampleCount} 个。`
+  const labels = probability3dRatings.value.map(key => probability3dRatingOptions.find(item => item.key === key)?.label || key).join('+')
+  return `当前显示：${labels}合并概率和区域样本数 n；拖动可旋转，滚轮或双指可缩放；${memoryCount} 个记忆持久度桶 × ${studyCount} 个学习次数桶；复习样本 ${sampleCount} 个。`
 })
+
+function toggleProbability3dRating(key, checked) {
+  const current = probability3dRatings.value
+  if (checked) {
+    probability3dRatings.value = current.includes(key) ? current : [...current, key]
+    return
+  }
+  const next = current.filter(item => item !== key)
+  probability3dRatings.value = next.length ? next : [key]
+}
 </script>
 
 <style scoped>
@@ -178,16 +195,6 @@ const probability3dSummary = computed(() => {
   font-weight: 600;
 }
 
-.probability-table td.probability-cell-no-data {
-  background: #cbd5e1;
-  color: #64748b;
-  font-weight: 600;
-}
-.probability-table td.probability-cell-insufficient {
-  background: #e5e7eb;
-  color: #334155;
-}
-
 .table-note {
   margin-top: 8px;
 }
@@ -215,6 +222,17 @@ const probability3dSummary = computed(() => {
   gap: 6px;
   font-size: 13px;
   white-space: nowrap;
+}
+.probability-rating-checks {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px 10px;
+  font-size: 13px;
+}
+.probability-rating-checks label {
+  margin: 0;
 }
 .probability-3d-summary {
   margin-top: 8px;

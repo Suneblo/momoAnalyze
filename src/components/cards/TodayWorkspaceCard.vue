@@ -1,13 +1,11 @@
 <template>
   <div class="today-workspace-card">
     <div class="toolbar compact-toolbar">
-      <label class="date-field">日期 <input v-model="date" type="date"></label>
-      <el-button size="small" :loading="loading" @click="reloadWorkspace">重新加载</el-button>
       <el-button size="small" :disabled="!workspace.allProgressText" @click="copyAllProgress">复制所有时间点进度</el-button>
     </div>
 
     <div class="info-row">
-      <span>当前日期：{{ workspace.date || date || '-' }}</span>
+      <span>当前日期：{{ workspace.date || '-' }}</span>
       <span>快照数量：{{ snapshots.length }}</span>
       <span v-if="workspace.error" class="error-text">{{ workspace.error }}</span>
     </div>
@@ -87,6 +85,7 @@
         <el-button size="small" :disabled="!compareOutput" @click="copyCompareResult">复制差异结果</el-button>
       </div>
       <div class="check-list">
+        <label><input v-model="compareOptions.tableStats" type="checkbox"> 表格汇总</label>
         <label><input v-model="compareOptions.progress" type="checkbox"> 进度变化</label>
         <label><input v-model="compareOptions.added" type="checkbox"> 新增条目</label>
         <label><input v-model="compareOptions.removed" type="checkbox"> 消失条目</label>
@@ -104,8 +103,9 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useDataStore } from '@/stores/dataStore'
+import { useSettingsStore } from '@/stores/settingsStore'
 import { useApi } from '@/composables/useApi'
 
 const COPY_STATE_KEY = 'momoTodayWorkspaceCopyState'
@@ -123,34 +123,24 @@ function loadSavedCopyState() {
 defineProps({ card: Object })
 
 const dataStore = useDataStore()
+const settings = useSettingsStore()
 const api = useApi()
 const savedCopyState = loadSavedCopyState()
-const loading = ref(false)
 const status = ref('')
-const date = ref(savedCopyState.date || localDateString())
-const selectedSnapshotName = ref(savedCopyState.selectedSnapshotName || '')
+const selectedSnapshotName = ref(dataStore.selectedTodaySnapshotName || savedCopyState.selectedSnapshotName || '')
 const compareA = ref(savedCopyState.compareA || '')
 const compareB = ref(savedCopyState.compareB || '')
 const singleOutput = ref('')
 const compareOutput = ref('')
 
 const singleOptions = reactive({ progress: true, allItems: false, doneItems: false, todoItems: false, ...(savedCopyState.singleOptions || {}) })
-const compareOptions = reactive({ progress: true, added: true, removed: true, statusChanged: true, responseChanged: true, memoryChanged: true, studyCountChanged: true, studyTimeChanged: false, ...(savedCopyState.compareOptions || {}) })
+const compareOptions = reactive({ tableStats: true, progress: true, added: true, removed: true, statusChanged: true, responseChanged: true, memoryChanged: true, studyCountChanged: true, studyTimeChanged: false, ...(savedCopyState.compareOptions || {}) })
 
 const workspace = computed(() => dataStore.todayWorkspace || { date: '', snapshots: [], allProgressText: '', error: '' })
 const snapshots = computed(() => {
   const items = Array.isArray(workspace.value.snapshots) ? workspace.value.snapshots : []
   return [...items].sort((a, b) => String(a?.name || a?.displayName || '').localeCompare(String(b?.name || b?.displayName || '')))
 })
-
-function localDateString() {
-  const d = new Date()
-  const y = d.getFullYear()
-  const m = String(d.getMonth() + 1).padStart(2, '0')
-  const day = String(d.getDate()).padStart(2, '0')
-  return `${y}-${m}-${day}`
-}
-
 function summaryOf(snapshot) {
   return snapshot?.summary || {}
 }
@@ -216,7 +206,6 @@ function rowsToCSV(headers, rows) {
 function saveCopyState() {
   try {
     localStorage.setItem(COPY_STATE_KEY, JSON.stringify({
-      date: date.value,
       selectedSnapshotName: selectedSnapshotName.value,
       compareA: compareA.value,
       compareB: compareB.value,
@@ -431,7 +420,7 @@ function actualReviewHappenedBetween(beforeItem, afterItem) {
   // 不用 study_count / 记忆持久度单独判定复习，避免把历史基线差异误报为“今日复习”。
   const beforeLast = lastReviewDate(beforeItem)
   const afterLast = lastReviewDate(afterItem)
-  const workspaceDate = workspace.value?.date || date.value || ''
+  const workspaceDate = workspace.value?.date || ''
   if (afterFinished && afterLast && afterLast !== beforeLast && (!workspaceDate || afterLast.slice(0, 10) === workspaceDate)) return true
 
   return false
@@ -511,10 +500,11 @@ function clearSingleAll() {
 
 function selectSnapshot(name) {
   selectedSnapshotName.value = name
+  dataStore.setSelectedTodaySnapshotName(name)
   refreshSinglePreview()
 }
 
-function compareSnapshots(showAlert = true) {
+async function compareSnapshots(showAlert = true) {
   const a = getSnapshotByName(compareA.value)
   const b = getSnapshotByName(compareB.value)
   if (!a || !b) {
@@ -538,6 +528,27 @@ function compareSnapshots(showAlert = true) {
   const removed = []
   const changedRows = []
   let ignoredLongTermChangeCount = 0
+  let tableDiffText = ''
+
+  if (compareOptions.tableStats && !usingInitialA) {
+    try {
+      status.value = '正在生成时间点表格差异…'
+      const data = await api.fetchTimepointDiff({
+        date: workspace.value.date,
+        snapshotA: a.name,
+        snapshotB: b.name,
+        memoryThresholds: settings.memoryThresholds,
+        criticalFutureDays: settings.criticalFutureDays,
+      })
+      if (data?.success && data.diff?.available !== false) {
+        tableDiffText = data.diff?.copyText || ''
+      } else if (showAlert) {
+        status.value = `表格差异生成失败：${data?.diff?.error || data?.error || '未知错误'}`
+      }
+    } catch (error) {
+      if (showAlert) status.value = `表格差异生成失败：${error.message || error}`
+    }
+  }
 
   for (const key of bKeys) if (!aKeys.has(key)) added.push(simplifyCompareItem(bMap.get(key)))
   for (const key of aKeys) if (!bKeys.has(key)) removed.push(simplifyCompareItem(aMap.get(key)))
@@ -602,11 +613,13 @@ function compareSnapshots(showAlert = true) {
     if (hasVisibleChange) changedRows.push(row)
   }
 
-  const lines = [`对比: ${a.displayName || a.name} -> ${b.displayName || b.name}`]
+  const lines = tableDiffText
+    ? [tableDiffText]
+    : [`对比: ${a.displayName || a.name} -> ${b.displayName || b.name}`]
   const am = a.summary || {}
   const bm = b.summary || {}
 
-  if (compareOptions.progress) {
+  if (compareOptions.progress && !tableDiffText) {
     lines.push('', '【进度变化】')
     lines.push(`已完成变化: ${(bProg.finished || bm.finished || 0) - (aProg.finished || am.finished || 0)}`)
     lines.push(`总数变化: ${(bProg.total || bm.total || 0) - (aProg.total || am.total || 0)}`)
@@ -630,6 +643,7 @@ function compareSnapshots(showAlert = true) {
   }
 
   compareOutput.value = lines.join('\n')
+  if (showAlert) status.value = '差异结果已生成。'
   saveCopyState()
 }
 
@@ -692,47 +706,29 @@ async function copyAllProgress() {
   await copyText(workspace.value.allProgressText || '', '已复制所有时间点进度。')
 }
 
-async function reloadWorkspace() {
-  loading.value = true
-  status.value = '正在重新加载当日时间点数据…'
-  try {
-    const data = await api.fetchTodayWorkspace(date.value)
-    if (!data?.success) throw new Error(data?.error || '加载当日时间点失败')
-    dataStore.todayWorkspace = data.todayWorkspace || { date: date.value, snapshots: [], allProgressText: '', error: '该日期暂无快照数据' }
-    status.value = `加载完成：${snapshots.value.length} 个快照。`
-    saveCopyState()
-  } catch (error) {
-    status.value = `加载失败：${error.message || error}`
-  } finally {
-    loading.value = false
-  }
-}
-
 watch(snapshots, value => {
   const latest = value[value.length - 1]?.name || ''
   const previous = value[value.length - 2]?.name || ''
   const first = value[0]?.name || ''
   if (!selectedSnapshotName.value || !value.some(item => item.name === selectedSnapshotName.value)) selectedSnapshotName.value = latest
+  dataStore.setSelectedTodaySnapshotName(selectedSnapshotName.value)
   if (!compareA.value || (compareA.value !== INITIAL_SNAPSHOT_NAME && !value.some(item => item.name === compareA.value))) compareA.value = previous || first || INITIAL_SNAPSHOT_NAME
   if (!compareB.value || !value.some(item => item.name === compareB.value)) compareB.value = latest
   if (value.length >= 2 && compareA.value === compareB.value) compareA.value = previous || first || INITIAL_SNAPSHOT_NAME
   refreshSinglePreview()
 }, { immediate: true })
 
-watch([date, selectedSnapshotName, compareA, compareB], saveCopyState)
+watch([selectedSnapshotName, compareA, compareB], () => {
+  dataStore.setSelectedTodaySnapshotName(selectedSnapshotName.value)
+  saveCopyState()
+})
 watch(singleOptions, () => { refreshSinglePreview() }, { deep: true })
 watch(compareOptions, saveCopyState, { deep: true })
 
-onMounted(() => {
-  if (workspace.value.date) date.value = workspace.value.date
-  if (!snapshots.value.length) reloadWorkspace()
-})
 </script>
 
 <style scoped>
 .compact-toolbar { gap: 8px; }
-.date-field { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
-.date-field input { padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; }
 .info-row { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 8px 0; font-size: 13px; color: var(--text-muted); }
 .error-text { color: #dc2626; }
 .table-wrapper { overflow: auto; margin-top: 8px; }
