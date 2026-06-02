@@ -3,10 +3,27 @@ import { ref } from 'vue'
 const BASE = ''
 const CLOUD_WRITE_CONFIRM_HEADER = 'X-Momo-Cloud-Write-Confirm'
 const CLOUD_WRITE_CONFIRM_VALUE = 'waited-5s'
+const inFlightGetRequests = new Map()
 
 function cacheBust(url) {
   const sep = url.includes('?') ? '&' : '?'
   return `${BASE}${url}${sep}_momo_t=${Date.now()}`
+}
+
+function pageIsHidden() {
+  return typeof document !== 'undefined' && document.visibilityState === 'hidden'
+}
+
+function waitUntilPageVisible() {
+  if (!pageIsHidden()) return Promise.resolve()
+  return new Promise(resolve => {
+    const onVisible = () => {
+      if (pageIsHidden()) return
+      document.removeEventListener('visibilitychange', onVisible)
+      resolve()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+  })
 }
 
 function cloudWriteHeaders(headers = {}) {
@@ -70,19 +87,54 @@ export function useApi() {
   const error = ref(null)
 
   async function fetchJson(url, options = {}) {
-    loading.value = true
-    error.value = null
-    try {
-      const resp = await fetch(cacheBust(url), { cache: 'no-store', ...options })
-      const data = await parseJsonResponse(resp, url)
-      if (data?.success === false && data.error) error.value = data.error
-      return data
-    } catch (e) {
-      error.value = e.message || String(e)
-      return { success: false, error: error.value }
-    } finally {
-      loading.value = false
+    const {
+      dedupe = true,
+      waitForVisible = true,
+      ...fetchOptions
+    } = options
+    const requestKey = `${BASE}${url}`
+
+    if (waitForVisible) await waitUntilPageVisible()
+    if (dedupe && inFlightGetRequests.has(requestKey)) {
+      return inFlightGetRequests.get(requestKey)
     }
+
+    const requestPromise = (async () => {
+      loading.value = true
+      error.value = null
+      try {
+        const resp = await fetch(cacheBust(url), { cache: 'no-store', ...fetchOptions })
+        const data = await parseJsonResponse(resp, url)
+        if (data?.success === false && data.error) error.value = data.error
+        return data
+      } catch (e) {
+        error.value = e.message || String(e)
+        return { success: false, error: error.value }
+      } finally {
+        loading.value = false
+      }
+    })()
+
+    if (dedupe) {
+      inFlightGetRequests.set(requestKey, requestPromise)
+    }
+
+    try {
+      const data = await requestPromise
+      return data
+    } finally {
+      if (inFlightGetRequests.get(requestKey) === requestPromise) {
+        inFlightGetRequests.delete(requestKey)
+      }
+    }
+  }
+
+  async function fetchJsonImmediate(url, options = {}) {
+    return fetchJson(url, { waitForVisible: false, ...options })
+  }
+
+  async function fetchJsonNoDedupe(url, options = {}) {
+    return fetchJson(url, { dedupe: false, ...options })
   }
 
   async function fetchDashboardPage(offset = 0, limit = 3, order = 'asc', options = {}) {
@@ -135,6 +187,7 @@ export function useApi() {
   }
 
   async function syncFromApi() {
+    inFlightGetRequests.clear()
     loading.value = true
     try {
       const resp = await fetch(cacheBust('/api/sync'), { method: 'POST', cache: 'no-store' })
@@ -171,11 +224,13 @@ export function useApi() {
       error.value = e.message || String(e)
       return { success: false, error: error.value }
     } finally {
+      inFlightGetRequests.clear()
       loading.value = false
     }
   }
 
   async function postJson(url, body, options = {}) {
+    inFlightGetRequests.clear()
     loading.value = true
     error.value = null
     try {
@@ -195,6 +250,7 @@ export function useApi() {
       error.value = e.message || String(e)
       return { success: false, error: error.value }
     } finally {
+      inFlightGetRequests.clear()
       loading.value = false
     }
   }
@@ -235,6 +291,8 @@ export function useApi() {
     loading,
     error,
     fetchJson,
+    fetchJsonImmediate,
+    fetchJsonNoDedupe,
     fetchDashboardPage,
     fetchAlerts,
     fetchTodayWorkspace,

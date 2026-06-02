@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 from momo_api import (
     add_words_to_study,
@@ -87,6 +87,16 @@ except Exception:
 
 CLOUD_WRITE_CONFIRM_HEADER = "X-Momo-Cloud-Write-Confirm"
 CLOUD_WRITE_CONFIRM_VALUE = "waited-5s"
+
+API_RESPONSE_CACHE_TTLS = {
+    "/api/dashboard-data-page": 30.0,
+    "/api/today-workspace": 30.0,
+    "/api/timepoint-diff": 20.0,
+    "/api/words": 15.0,
+    "/api/custom-words/today": 15.0,
+}
+API_RESPONSE_CACHE_IGNORE_QUERY = {"_momo_t"}
+API_RESPONSE_CACHE_MAX_ENTRIES = 64
 
 CLOUD_WRITE_PATHS = {
     "/api/notepads/create",
@@ -478,26 +488,57 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         super().end_headers()
 
-    def send_json(self, payload, status: HTTPStatus = HTTPStatus.OK) -> None:
-        dump_start = time.perf_counter()
-        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        dump_ms = (time.perf_counter() - dump_start) * 1000
-
+    def send_json_bytes(
+        self,
+        data: bytes,
+        status: HTTPStatus | int = HTTPStatus.OK,
+        *,
+        dump_ms: float | None = None,
+        cache_state: str | None = None,
+    ) -> None:
+        status_code = int(status)
         write_start = time.perf_counter()
         try:
-            self.send_response(status)
+            self.send_response(status_code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
+            if cache_state:
+                self.send_header("X-Momo-Api-Cache", cache_state)
             self.end_headers()
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError) as exc:
             self.close_connection = True
-            service_log(f"客户端已断开，停止写响应 status={int(status)} size={len(data) / 1024:.1f}KB，原因={exc.__class__.__name__}")
+            service_log(f"客户端已断开，停止写响应 status={status_code} size={len(data) / 1024:.1f}KB，原因={exc.__class__.__name__}")
             raise ClientDisconnected() from exc
 
         write_ms = (time.perf_counter() - write_start) * 1000
-        if len(data) >= 200_000 or dump_ms >= 100 or write_ms >= 100:
-            service_log(f"JSON 响应 status={int(status)} size={len(data) / 1024:.1f}KB dump={dump_ms:.1f}ms write={write_ms:.1f}ms")
+        dump_text = f"{dump_ms:.1f}ms" if dump_ms is not None else "cached"
+        if len(data) >= 200_000 or (dump_ms is not None and dump_ms >= 100) or write_ms >= 100:
+            suffix = f" cache={cache_state}" if cache_state else ""
+            service_log(f"JSON 响应 status={status_code} size={len(data) / 1024:.1f}KB dump={dump_text} write={write_ms:.1f}ms{suffix}")
+
+    def send_json(self, payload, status: HTTPStatus = HTTPStatus.OK) -> bytes:
+        dump_start = time.perf_counter()
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        dump_ms = (time.perf_counter() - dump_start) * 1000
+        self.send_json_bytes(data, status, dump_ms=dump_ms)
+        return data
+
+    def send_cacheable_json(
+        self,
+        payload,
+        cache_key: str | None,
+        cache_flight: dict[str, object] | None,
+        status: HTTPStatus = HTTPStatus.OK,
+    ) -> bytes:
+        dump_start = time.perf_counter()
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        dump_ms = (time.perf_counter() - dump_start) * 1000
+        cache_state = None
+        if cache_key and cache_flight is not None:
+            cache_state = self.server.finish_api_cache_flight(cache_key, cache_flight, data, int(status))
+        self.send_json_bytes(data, status, dump_ms=dump_ms, cache_state=cache_state)
+        return data
 
     def send_error_json(self, status: HTTPStatus, message: str) -> None:
         self.send_json({"success": False, "error": message}, status)
@@ -529,6 +570,7 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/sync":
+            self.server.clear_api_response_cache()
             self.handle_sync()
             return
         if parsed.path == "/api/fsrs-prediction":
@@ -546,6 +588,7 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
             "/api/study/add-words",
             "/api/custom-words",
         ):
+            self.server.clear_api_response_cache()
             self.handle_write_api(parsed)
             return
         self.send_error_json(HTTPStatus.NOT_FOUND, f"未知接口: {parsed.path}")
@@ -880,6 +923,8 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
         except Exception as exc:
             service_log(f"POST 接口异常 {parsed.path}: {exc}\n{traceback.format_exc()}")
             self.send_json({"success": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+        finally:
+            self.server.clear_api_response_cache()
 
     def handle_sync(self) -> None:
         parsed = urlparse(self.path)
@@ -983,6 +1028,7 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
                 self.wfile.flush()
             except Exception:
                 pass
+            self.server.clear_api_response_cache()
 
     def handle_api(self, parsed) -> None:
         request_start = time.perf_counter()
@@ -992,11 +1038,39 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
         heavy_paths = {"/api/dashboard-data-page", "/api/words", "/api/today-workspace", "/api/timepoint-diff"}
         track_request = parsed.path != "/api/health"
         is_heavy_request = parsed.path in heavy_paths
+        cache_key = self.server.api_cache_key(parsed.path, query)
+        cache_flight: dict[str, object] | None = None
+        cache_owner = False
 
         if track_request:
             self.server.begin_api_request(is_heavy_request)
 
         try:
+            if cache_key:
+                cached = self.server.get_api_cache_bytes(cache_key)
+                if cached is not None:
+                    status, data = cached
+                    service_log(f"API 缓存命中 {parsed.path} size={len(data) / 1024:.1f}KB 总耗时={(time.perf_counter() - request_start) * 1000:.1f}ms")
+                    self.send_json_bytes(data, status, cache_state="hit")
+                    return
+
+                cache_owner, cache_flight = self.server.begin_api_cache_flight(cache_key)
+                if not cache_owner:
+                    wait_start = time.perf_counter()
+                    try:
+                        status, data = self.server.wait_api_cache_flight(cache_key, cache_flight)
+                        service_log(
+                            f"API 请求合并 {parsed.path} wait={(time.perf_counter() - wait_start) * 1000:.1f}ms "
+                            f"size={len(data) / 1024:.1f}KB 总耗时={(time.perf_counter() - request_start) * 1000:.1f}ms"
+                        )
+                        self.send_json_bytes(data, status, cache_state="join")
+                        return
+                    except Exception as exc:
+                        service_log(f"API 请求合并等待失败 {parsed.path}: {exc}；本次改为独立计算")
+                        cache_key = None
+                        cache_flight = None
+                        cache_owner = False
+
             open_start = time.perf_counter()
             with db_connect(self.server.db_path) as conn:
                 service_log(f"API 数据库连接+打开 {parsed.path} 耗时 {(time.perf_counter() - open_start) * 1000:.1f}ms")
@@ -1009,7 +1083,7 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
                         "schemaVersion": row["value"] if row else "unknown",
                     }
                     payload.update(self.server.runtime_health())
-                    self.send_json(payload)
+                    self.send_cacheable_json(payload, cache_key if cache_owner else None, cache_flight)
                     return
 
                 if parsed.path == "/api/dashboard-data-page":
@@ -1033,7 +1107,7 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
                         f"构建耗时={(time.perf_counter() - build_start) * 1000:.1f}ms "
                         f"总耗时={(time.perf_counter() - request_start) * 1000:.1f}ms"
                     )
-                    self.send_json(payload)
+                    self.send_cacheable_json(payload, cache_key if cache_owner else None, cache_flight)
                     return
 
                 if parsed.path == "/api/alerts":
@@ -1048,7 +1122,7 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
                     build_start = time.perf_counter()
                     payload = {"success": True, "todayWorkspace": get_today_workspace(conn, day_key=workspace_date)}
                     service_log(f"API /api/today-workspace date={workspace_date} 耗时 {(time.perf_counter() - build_start) * 1000:.1f}ms")
-                    self.send_json(payload)
+                    self.send_cacheable_json(payload, cache_key if cache_owner else None, cache_flight)
                     return
 
                 if parsed.path == "/api/custom-words/today":
@@ -1056,7 +1130,7 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
                     build_start = time.perf_counter()
                     payload = {"success": True, "customWords": get_today_custom_words(conn, day_key=workspace_date)}
                     service_log(f"API /api/custom-words/today date={workspace_date} 耗时 {(time.perf_counter() - build_start) * 1000:.1f}ms")
-                    self.send_json(payload)
+                    self.send_cacheable_json(payload, cache_key if cache_owner else None, cache_flight)
                     return
 
                 if parsed.path == "/api/timepoint-diff":
@@ -1095,7 +1169,7 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
                         f"a={diff.get('snapshotA')} b={diff.get('snapshotB')} "
                         f"耗时 {(time.perf_counter() - build_start) * 1000:.1f}ms"
                     )
-                    self.send_json({"success": True, "diff": diff})
+                    self.send_cacheable_json({"success": True, "diff": diff}, cache_key if cache_owner else None, cache_flight)
                     return
 
                 if parsed.path == "/api/words":
@@ -1107,7 +1181,7 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
                         f"items={len(payload.get('items') or [])} 耗时={(time.perf_counter() - build_start) * 1000:.1f}ms "
                         f"明细={payload.get('timings', {})}"
                     )
-                    self.send_json(payload)
+                    self.send_cacheable_json(payload, cache_key if cache_owner else None, cache_flight)
                     return
 
                 if parsed.path == "/api/records-by-words":
@@ -1142,12 +1216,18 @@ class MomoRequestHandler(SimpleHTTPRequestHandler):
                 self.send_error_json(HTTPStatus.NOT_FOUND, f"未知接口: {parsed.path}")
 
         except ClientDisconnected:
+            if cache_owner:
+                self.server.fail_api_cache_flight(cache_key, cache_flight, "客户端取消了原始请求")
             service_log(f"API 结束 {parsed.path}：浏览器已取消请求，总耗时 {(time.perf_counter() - request_start) * 1000:.1f}ms")
             return
         except sqlite3.Error as exc:
+            if cache_owner:
+                self.server.fail_api_cache_flight(cache_key, cache_flight, exc)
             service_log(f"API 数据库异常 {parsed.path}: {exc}\n{traceback.format_exc()}")
             self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, f"数据库错误: {exc}")
         except Exception as exc:
+            if cache_owner:
+                self.server.fail_api_cache_flight(cache_key, cache_flight, exc)
             service_log(f"API 服务异常 {parsed.path}: {exc}\n{traceback.format_exc()}")
             self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, f"服务错误: {exc}")
         finally:
@@ -1169,6 +1249,132 @@ class MomoHTTPServer(ThreadingHTTPServer):
         self.max_active_api_requests = 0
         self.max_active_heavy_requests = 0
         self.last_heavy_finished_at = 0.0
+        self._api_cache_lock = threading.Lock()
+        self._api_response_cache: dict[str, dict[str, object]] = {}
+        self._api_response_flights: dict[str, dict[str, object]] = {}
+
+    def api_cache_key(self, path: str, query: dict[str, str]) -> str | None:
+        if path not in API_RESPONSE_CACHE_TTLS:
+            return None
+        normalized = [
+            (str(key), str(value))
+            for key, value in query.items()
+            if key not in API_RESPONSE_CACHE_IGNORE_QUERY
+        ]
+        normalized.sort()
+        return f"{path}?{urlencode(normalized, doseq=True)}"
+
+    def _prune_api_cache_locked(self, now: float | None = None) -> None:
+        current = time.monotonic() if now is None else now
+        expired = [
+            key for key, entry in self._api_response_cache.items()
+            if float(entry.get("expires_at") or 0.0) <= current
+        ]
+        for key in expired:
+            self._api_response_cache.pop(key, None)
+
+        while len(self._api_response_cache) > API_RESPONSE_CACHE_MAX_ENTRIES:
+            oldest = min(
+                self._api_response_cache,
+                key=lambda key: float(self._api_response_cache[key].get("created_at") or 0.0),
+            )
+            self._api_response_cache.pop(oldest, None)
+
+    def get_api_cache_bytes(self, key: str) -> tuple[int, bytes] | None:
+        now = time.monotonic()
+        with self._api_cache_lock:
+            entry = self._api_response_cache.get(key)
+            if not entry:
+                return None
+            if float(entry.get("expires_at") or 0.0) <= now:
+                self._api_response_cache.pop(key, None)
+                return None
+            data = entry.get("data")
+            status = int(entry.get("status") or 200)
+            if not isinstance(data, bytes):
+                return None
+            return status, data
+
+    def begin_api_cache_flight(self, key: str) -> tuple[bool, dict[str, object]]:
+        with self._api_cache_lock:
+            flight = self._api_response_flights.get(key)
+            if flight is not None:
+                flight["waiters"] = int(flight.get("waiters") or 0) + 1
+                return False, flight
+
+            flight = {
+                "event": threading.Event(),
+                "started_at": time.monotonic(),
+                "waiters": 0,
+                "status": None,
+                "data": None,
+                "error": None,
+            }
+            self._api_response_flights[key] = flight
+            return True, flight
+
+    def wait_api_cache_flight(self, key: str, flight: dict[str, object], timeout: float = 90.0) -> tuple[int, bytes]:
+        event = flight.get("event")
+        if not hasattr(event, "wait"):
+            raise RuntimeError("请求合并状态异常")
+        if not event.wait(timeout):
+            raise TimeoutError("等待相同 API 请求完成超时")
+
+        with self._api_cache_lock:
+            data = flight.get("data")
+            status = int(flight.get("status") or 200)
+            error = flight.get("error")
+            if isinstance(data, bytes):
+                return status, data
+            if error:
+                raise RuntimeError(str(error))
+            raise RuntimeError("相同 API 请求未返回结果")
+
+    def finish_api_cache_flight(self, key: str, flight: dict[str, object], data: bytes, status: int) -> str | None:
+        ttl = API_RESPONSE_CACHE_TTLS.get(key.split("?", 1)[0])
+        now = time.monotonic()
+        cache_state = None
+        with self._api_cache_lock:
+            if status == int(HTTPStatus.OK) and ttl:
+                self._api_response_cache[key] = {
+                    "data": data,
+                    "status": status,
+                    "created_at": now,
+                    "expires_at": now + float(ttl),
+                    "size": len(data),
+                }
+                self._prune_api_cache_locked(now)
+                cache_state = "store"
+
+            flight["data"] = data
+            flight["status"] = status
+            flight["error"] = None
+            self._api_response_flights.pop(key, None)
+            event = flight.get("event")
+            if hasattr(event, "set"):
+                event.set()
+        return cache_state
+
+    def fail_api_cache_flight(self, key: str | None, flight: dict[str, object] | None, error: object) -> None:
+        if not key or flight is None:
+            return
+        with self._api_cache_lock:
+            if self._api_response_flights.get(key) is flight:
+                self._api_response_flights.pop(key, None)
+            flight["error"] = error
+            event = flight.get("event")
+            if hasattr(event, "set"):
+                event.set()
+
+    def clear_api_response_cache(self) -> None:
+        with self._api_cache_lock:
+            self._api_response_cache.clear()
+            for flight in self._api_response_flights.values():
+                flight["error"] = "缓存已因数据写入失效"
+                event = flight.get("event")
+                if hasattr(event, "set"):
+                    event.set()
+            self._api_response_flights.clear()
 
     def begin_api_request(self, heavy: bool = False) -> None:
         with self._request_lock:
@@ -1192,6 +1398,9 @@ class MomoHTTPServer(ThreadingHTTPServer):
             max_api = self.max_active_api_requests
             max_heavy = self.max_active_heavy_requests
             last_heavy = self.last_heavy_finished_at
+        with self._api_cache_lock:
+            cache_entries = len(self._api_response_cache)
+            cache_flights = len(self._api_response_flights)
         return {
             "serviceKind": "momo_sqlite_dashboard",
             "serviceVersion": "20260528_light_routes_no_legacy",
@@ -1201,6 +1410,8 @@ class MomoHTTPServer(ThreadingHTTPServer):
             "maxActiveApiRequests": max_api,
             "maxActiveHeavyRequests": max_heavy,
             "lastHeavyFinishedAgoSeconds": None if not last_heavy else round(max(0.0, time.time() - last_heavy), 3),
+            "apiResponseCacheEntries": cache_entries,
+            "apiResponseFlights": cache_flights,
             "idle": active_api == 0 and active_heavy == 0,
         }
 
