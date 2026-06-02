@@ -1190,16 +1190,23 @@ def parse_snapshot_display_time(captured_at: str) -> int:
 
 
 #返回单词结构
-def enrich_today_items_with_prediction_raw_data(items: list[dict[str, Any]], overview_records: list[dict[str, Any]], day_key: str, snapshot_time: str | None = None, conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
+def enrich_today_items_with_prediction_raw_data(
+    items: list[dict[str, Any]],
+    overview_records: list[dict[str, Any]],
+    day_key: str,
+    snapshot_time: str | None = None,
+    conn: sqlite3.Connection | None = None,
+    history_index: dict[str, list[dict[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
     """Attach memory fields from the same historical input chain used by FSRS.
 
-    Current values are built from the current overview records, via the same
-    raw summary buckets used by dashboard prediction displays.
+    Current values are built from the current overview records and matched by
+    the local word_key used by the compact schema.
 
     Previous values are NOT derived from time-point A and NOT from patch
     event old_* fields.  They come from the per-word historical review event
     sequence used as FSRS input.  For a current study_count=N, previous is the
-    latest recovered review event for the same voc_id with study_count<N.
+    latest recovered review event for the same word_key with study_count<N.
     """
     if not items:
         return items
@@ -1244,9 +1251,10 @@ def enrich_today_items_with_prediction_raw_data(items: list[dict[str, Any]], ove
         return None
 
     def _raw_from_overview_record(rec: dict[str, Any]) -> dict[str, Any] | None:
-        vid = str(rec.get("voc_id") or rec.get("vocId") or "").strip()
-        if not vid:
+        key = record_key(rec)
+        if not key:
             return None
+        vid = str(rec.get("voc_id") or rec.get("vocId") or "").strip()
         last_study = rec.get("last_study_date") or rec.get("lastStudyDate") or ""
         next_study = rec.get("next_study_date") or rec.get("nextStudyDate") or ""
         span_days = _date_diff_days(next_study, last_study)
@@ -1256,6 +1264,7 @@ def enrich_today_items_with_prediction_raw_data(items: list[dict[str, Any]], ove
         if span_days is None and study_count in (None, "") and not last_study and not next_study:
             return None
         return {
+            "wordKey": key,
             "word": rec.get("spelling") or rec.get("voc_spelling") or rec.get("word") or "",
             "vocId": vid,
             "days": span_days,
@@ -1265,49 +1274,36 @@ def enrich_today_items_with_prediction_raw_data(items: list[dict[str, Any]], ove
             "lastResponse": rec.get("last_response_cn") or rec.get("last_response") or rec.get("lastResponse") or "",
         }
 
-    raw_by_voc_id: dict[str, dict[str, Any]] = {}
+    raw_by_word_key: dict[str, dict[str, Any]] = {}
 
     if overview_records:
-        try:
-            raw_summary = build_dashboard_summary_from_records(overview_records, items, day_key, snapshot_time, include_memory_items=True)
-        except Exception:
-            raw_summary = {}
-
-        for bucket_name in ("memoryReviewSpanItems", "memoryNextDueItems", "memoryReviewOutcomeItems", "memoryDiffItems"):
-            for raw in raw_summary.get(bucket_name) or []:
-                vid = str(raw.get("vocId") or raw.get("voc_id") or "").strip()
-                if vid and vid not in raw_by_voc_id:
-                    raw_by_voc_id[vid] = raw
-
-        # Fallback: raw summary buckets may omit some rows; use the overview
-        # record itself in the same shape.
         for rec in overview_records:
-            vid = str(rec.get("voc_id") or rec.get("vocId") or "").strip()
-            if not vid or vid in raw_by_voc_id:
+            key = record_key(rec)
+            if not key or key in raw_by_word_key:
                 continue
             raw = _raw_from_overview_record(rec)
             if raw:
-                raw_by_voc_id[vid] = raw
+                raw_by_word_key[key] = raw
 
-    voc_ids: set[str] = set()
+    word_keys: set[str] = set()
     for item in items:
-        vid = str(item.get("voc_id") or item.get("vocId") or "").strip()
-        if vid:
-            voc_ids.add(vid)
+        key = item_key(item)
+        if key:
+            word_keys.add(key)
 
-    history_index: dict[str, list[dict[str, Any]]] = {}
-    if conn is not None and voc_ids:
+    history_by_word_key: dict[str, list[dict[str, Any]]] = history_index or {}
+    if history_index is None and conn is not None and word_keys:
         try:
             from momo_fsrs import build_review_history_state_index
-            history_index = build_review_history_state_index(conn, voc_ids=voc_ids, max_words=100000)
+            history_by_word_key = build_review_history_state_index(conn, word_keys=word_keys, max_words=100000)
         except Exception:
-            history_index = {}
+            history_by_word_key = {}
 
     out: list[dict[str, Any]] = []
     for item in items:
         merged = dict(item)
-        vid = str(item.get("voc_id") or item.get("vocId") or "").strip()
-        raw = raw_by_voc_id.get(vid) if vid else None
+        key = item_key(item)
+        raw = raw_by_word_key.get(key) if key else None
 
         if raw:
             span_days = raw.get("days")
@@ -1333,7 +1329,7 @@ def enrich_today_items_with_prediction_raw_data(items: list[dict[str, Any]], ove
         if current_count is None:
             current_count = merged.get("study_count") or merged.get("studyCount")
 
-        previous_raw = _history_previous(history_index.get(vid) or [], current_count, raw) if vid else None
+        previous_raw = _history_previous(history_by_word_key.get(key) or [], current_count, raw) if key else None
         if previous_raw:
             previous_span_days = previous_raw.get("memoryDurabilityDays")
             if previous_span_days is None:

@@ -12,7 +12,6 @@ Windows usage:
 
 Android/Termux usage:
     python start.py
-    python start.py --tmux
 """
 
 from __future__ import annotations
@@ -645,58 +644,6 @@ def start_plain(args: argparse.Namespace, db_path: Path, termux: bool, runner: P
     return 0
 
 
-def start_tmux(args: argparse.Namespace, db_path: Path, runner: Path, termux_app: Path) -> int:
-    if not exe("tmux"):
-        raise RuntimeError("未找到 tmux。请安装 tmux，或直接运行: python start.py")
-
-    import shlex
-
-    env_prefix = " ".join(
-        [
-            f"MOMO_PROJECT={shlex.quote(str(ROOT))}",
-            f"MOMO_RUNNER={shlex.quote(str(runner))}",
-            f"BACKEND_HOST={shlex.quote(args.backend_host)}",
-            f"BACKEND_PORT={shlex.quote(str(args.backend_port))}",
-            f"FRONTEND_HOST={shlex.quote(args.frontend_host)}",
-            f"FRONTEND_PORT={shlex.quote(str(args.frontend_port))}",
-        ]
-    )
-
-    backend = quote_cmd(backend_command(args, db_path))
-    frontend = quote_cmd(frontend_command(args, True, runner, termux_app))
-    session = args.session
-
-    subprocess.run(["tmux", "kill-session", "-t", session], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.check_call(
-        [
-            "tmux",
-            "new-session",
-            "-d",
-            "-s",
-            session,
-            f"sh -lc 'cd {shlex.quote(str(ROOT))} && echo ===== Python backend starting ===== && {backend}; echo; echo ===== Python backend exited. Error is above. =====; tail -f /dev/null'",
-        ]
-    )
-    subprocess.check_call(
-        [
-            "tmux",
-            "split-window",
-            "-h",
-            "-t",
-            session,
-            f"sh -lc 'cd {shlex.quote(str(termux_app))} && echo ===== Vue frontend starting ===== && {env_prefix} {frontend}; echo; echo ===== Vue frontend exited. Error is above. =====; tail -f /dev/null'",
-        ]
-    )
-
-    url = f"http://127.0.0.1:{args.frontend_port}/"
-    if not args.no_open:
-        time.sleep(2)
-        open_browser(url, True)
-    log(f"tmux 会话已启动: {session}")
-    log(f"访问地址: {url}")
-    return subprocess.call(["tmux", "attach", "-t", session])
-
-
 def parse_args() -> argparse.Namespace:
     backend_host_default = config_backend_host(ROOT)
     backend_port_default = config_backend_port(ROOT)
@@ -711,12 +658,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frontend-host", default=os.environ.get("FRONTEND_HOST", frontend_host_default))
     parser.add_argument("--frontend-port", type=int, default=int(os.environ.get("FRONTEND_PORT", frontend_port_default)))
     parser.add_argument("--runner", default=os.environ.get("RUNNER"), help="Termux Vite runner 目录，默认 ~/momo-vite-runner")
-    parser.add_argument("--session", default=os.environ.get("SESSION", "momo"), help="Termux tmux 会话名")
     parser.add_argument("--install", action="store_true", help="兼容旧参数；当前默认会自动安装缺失依赖")
     parser.add_argument("--no-install", action="store_true", help="缺少依赖时只报错，不自动安装")
     parser.add_argument("--fix-frontend", action="store_true", help="重装前端依赖并固定到 Windows 稳定 Vite 5")
     parser.add_argument("--production", action="store_true", help="Windows/桌面端使用 npm run preview，而不是 npm run dev")
-    parser.add_argument("--tmux", action="store_true", help="Termux 下使用 tmux 分屏启动")
     parser.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
     return parser.parse_args()
 
@@ -757,8 +702,6 @@ def main() -> int:
             ensure_termux_runner(runner, auto_install)
             termux_app = sync_termux_frontend_app(runner, args)
             log(f"Termux 前端运行副本: {termux_app}")
-            if args.tmux:
-                return start_tmux(args, db_path, runner, termux_app)
             return start_plain(args, db_path, termux=True, runner=runner, termux_app=termux_app)
 
         ensure_project_node_modules(auto_install)

@@ -7,6 +7,7 @@ Only the latest compact_v4_word_key schema is supported by runtime code.
 from __future__ import annotations
 
 import math
+import threading
 
 from momo_db_common import *
 
@@ -138,6 +139,8 @@ COMPACT_REQUIRED_TABLES = {
     "reviews",
     "custom_words",
 }
+_SCHEMA_READY_DATABASES: set[str] = set()
+_SCHEMA_SETUP_LOCK = threading.Lock()
 
 PATCH_EMPTY_MARKER = "enmpty"
 
@@ -390,7 +393,30 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reviews_voc_id ON reviews(voc_id)")
 
 
+def _schema_database_key(conn: sqlite3.Connection) -> str:
+    for row in conn.execute("PRAGMA database_list").fetchall():
+        if str(row_value(row, "name") or "") != "main":
+            continue
+        filename = str(row_value(row, "file") or "").strip()
+        return str(Path(filename).resolve()) if filename else ""
+    return ""
+
+
 def setup_schema(conn: sqlite3.Connection) -> None:
+    database_key = _schema_database_key(conn)
+    if database_key and database_key in _SCHEMA_READY_DATABASES:
+        return
+
+    with _SCHEMA_SETUP_LOCK:
+        if database_key and database_key in _SCHEMA_READY_DATABASES:
+            return
+
+        _setup_schema_uncached(conn)
+        if database_key:
+            _SCHEMA_READY_DATABASES.add(database_key)
+
+
+def _setup_schema_uncached(conn: sqlite3.Connection) -> None:
     legacy_tables = {"compact_meta", "compact_overview_day_records", "compact_overview_day_checkpoints", "snapshot_progress"}
     if not _compact_table_exists(conn, "meta") and any(_compact_table_exists(conn, table) for table in legacy_tables):
         raise RuntimeError("检测到旧版 compact_v3 数据库，请先运行新版迁移到 compact_v4_word_key。")
@@ -1317,6 +1343,8 @@ def get_today_workspace(conn: sqlite3.Connection, day_key: str | None = None) ->
     snaps: list[dict[str, Any]] = []
     all_progress_lines: list[str] = []
     missing_detail_count = 0
+    history_index_cache: dict[str, list[dict[str, Any]]] = {}
+    history_loaded_keys: set[str] = set()
 
     for row in rows:
         detail_missing = _v3_progress_detail_missing(row)
@@ -1330,7 +1358,22 @@ def get_today_workspace(conn: sqlite3.Connection, day_key: str | None = None) ->
         except Exception:
             overview_records = []
         if all_items:
-            all_items = enrich_today_items_with_prediction_raw_data(all_items, overview_records, day_key, row["snapshot_time"], conn)
+            word_keys = {item_key(item) for item in all_items if item_key(item)}
+            missing_history_keys = word_keys - history_loaded_keys
+            if missing_history_keys:
+                try:
+                    from momo_fsrs import build_review_history_state_index
+                    history_index_cache.update(build_review_history_state_index(conn, word_keys=missing_history_keys, max_words=100000))
+                except Exception:
+                    pass
+                history_loaded_keys.update(missing_history_keys)
+            all_items = enrich_today_items_with_prediction_raw_data(
+                all_items,
+                overview_records,
+                day_key,
+                row["snapshot_time"],
+                history_index=history_index_cache,
+            )
         active_items = [x for x in all_items if x.get("present_state") != "confirmed_absent"]
         done_items = [x for x in active_items if x.get("is_finished") is True]
         todo_items = [x for x in active_items if x.get("is_finished") is not True]
@@ -3199,6 +3242,162 @@ def _light_overview_records_for_day(conn: sqlite3.Connection, day: str) -> list[
     return [_v3_overview_payload(row) for row in rows]
 
 
+def _light_date_ordinal(value: Any, cache: dict[str, int | None]) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text in cache:
+        return cache[text]
+    day = _date_only(text)
+    if not day:
+        cache[text] = None
+        return None
+    try:
+        out = datetime.strptime(day, "%Y-%m-%d").date().toordinal()
+    except Exception:
+        out = None
+    cache[text] = out
+    return out
+
+
+def _light_page_record_rows(conn: sqlite3.Connection, days: list[str]) -> list[dict[str, Any]]:
+    if not days:
+        return []
+    ph = _light_sql_placeholders(days)
+    rows = conn.execute(
+        f"""
+        SELECT
+          study_day_key,
+          study_count,
+          tags_text,
+          tag_well,
+          tag_sticking,
+          current_state,
+          is_overdue,
+          last_study_date,
+          next_study_date
+        FROM records
+        WHERE study_day_key IN ({ph})
+        """,
+        list(days),
+    ).fetchall()
+
+    date_cache: dict[str, int | None] = {}
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        next_ord = _light_date_ordinal(row["next_study_date"], date_cache)
+        last_ord = _light_date_ordinal(row["last_study_date"], date_cache)
+        day_ord = _light_date_ordinal(row["study_day_key"], date_cache)
+        out.append({
+            "study_day_key": row["study_day_key"],
+            "study_count": row["study_count"],
+            "tags_text": row["tags_text"],
+            "tag_well": row["tag_well"],
+            "tag_sticking": row["tag_sticking"],
+            "current_state": row["current_state"],
+            "is_overdue": row["is_overdue"],
+            "review_span_days": (next_ord - last_ord) if next_ord is not None and last_ord is not None else None,
+            "critical_days": (next_ord - day_ord) if next_ord is not None and day_ord is not None else None,
+        })
+    return out
+
+
+def _light_page_records_by_day(rows: list[dict[str, Any]], days: list[str]) -> dict[str, list[dict[str, Any]]]:
+    out: dict[str, list[dict[str, Any]]] = {day: [] for day in days}
+    for row in rows:
+        day = str(row["study_day_key"])
+        if day in out:
+            out[day].append({
+                "study_count": row["study_count"],
+                "tags_text": row["tags_text"],
+                "tag_well": row["tag_well"],
+                "tag_sticking": row["tag_sticking"],
+                "current_state": row["current_state"],
+                "is_overdue": row["is_overdue"],
+            })
+    return out
+
+
+def _light_page_latest_snapshots(conn: sqlite3.Connection, days: list[str]) -> dict[str, str]:
+    if not days:
+        return {}
+    ph = _light_sql_placeholders(days)
+    rows = conn.execute(
+        f"""
+        SELECT c.study_day_key, c.snapshot_time
+        FROM days c
+        JOIN snaps s ON s.snapshot_time=c.snapshot_time
+        WHERE c.study_day_key IN ({ph})
+          AND COALESCE(s.data_complete, 1)=1
+          AND COALESCE(s.api_success, 1)=1
+        """,
+        list(days),
+    ).fetchall()
+    out = {str(row["study_day_key"]): str(row["snapshot_time"]) for row in rows}
+    missing = [day for day in days if day not in out]
+    if not missing:
+        return out
+
+    missing_ph = _light_sql_placeholders(missing)
+    fallback_rows = conn.execute(
+        f"""
+        SELECT study_day_key, MAX(snapshot_time) AS snapshot_time
+        FROM snaps
+        WHERE study_day_key IN ({missing_ph})
+          AND COALESCE(data_complete, 1)=1
+          AND COALESCE(api_success, 1)=1
+        GROUP BY study_day_key
+        """,
+        missing,
+    ).fetchall()
+    for row in fallback_rows:
+        if row["snapshot_time"]:
+            out[str(row["study_day_key"])] = str(row["snapshot_time"])
+    return out
+
+
+def _light_page_progress_rows(
+    conn: sqlite3.Connection,
+    days: list[str],
+    snapshots: dict[str, str],
+) -> dict[str, sqlite3.Row]:
+    if not days:
+        return {}
+    ph = _light_sql_placeholders(days)
+    rows = conn.execute(
+        f"""
+        SELECT p.*
+        FROM progress p
+        JOIN snaps s ON s.snapshot_time=p.snapshot_time
+        WHERE p.study_day_key IN ({ph})
+          AND COALESCE(s.data_complete, 1)=1
+          AND COALESCE(s.api_success, 1)=1
+        ORDER BY p.study_day_key, p.snapshot_time DESC
+        """,
+        list(days),
+    ).fetchall()
+    candidates: dict[str, list[sqlite3.Row]] = {day: [] for day in days}
+    for row in rows:
+        day = str(row["study_day_key"])
+        if day in candidates and len(candidates[day]) < 20:
+            candidates[day].append(row)
+
+    out: dict[str, sqlite3.Row] = {}
+    for day, day_rows in candidates.items():
+        snapshot = snapshots.get(day)
+        exact = next(
+            (
+                row for row in day_rows
+                if str(row["snapshot_time"]) == snapshot and not _v3_progress_detail_missing(row)
+            ),
+            None,
+        )
+        fallback = next((row for row in day_rows if not _v3_progress_detail_missing(row)), None)
+        if exact or fallback:
+            out[day] = exact or fallback
+    return out
+
+
 def _light_latest_progress_row_for_day(conn: sqlite3.Connection, day: str, snapshot_time: str | None) -> sqlite3.Row | None:
     if snapshot_time:
         row = conn.execute(
@@ -3327,6 +3526,7 @@ def _light_page_memory_stats(
     conn: sqlite3.Connection,
     days: list[str],
     specs: list[dict[str, Any]],
+    rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, dict[str, Any]]]:
     if not days:
         return {}
@@ -3344,28 +3544,8 @@ def _light_page_memory_stats(
     if not specs:
         return empty
 
-    ph = _light_sql_placeholders(days)
-    rows = conn.execute(
-        f"""
-        SELECT
-          study_day_key,
-          study_count,
-          CAST(
-            julianday(date(next_study_date, '+8 hours'))
-            - julianday(date(last_study_date, '+8 hours'))
-            AS INTEGER
-          ) AS review_span_days,
-          CAST(
-            julianday(date(next_study_date, '+8 hours'))
-            - julianday(study_day_key)
-            AS INTEGER
-          ) AS critical_days
-        FROM records
-        WHERE study_day_key IN ({ph})
-        ORDER BY study_day_key
-        """,
-        list(days),
-    ).fetchall()
+    if rows is None:
+        rows = _light_page_record_rows(conn, days)
     if not rows:
         return empty
 
@@ -3840,17 +4020,27 @@ def get_dashboard_data_page_light(
     day_timings: list[dict[str, Any]] = []
 
     t0 = time.perf_counter()
+    page_record_rows = _light_page_record_rows(conn, page_days)
+    records_by_day = _light_page_records_by_day(page_record_rows, page_days)
+    timings["records_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+    t0 = time.perf_counter()
+    snapshots_by_day = _light_page_latest_snapshots(conn, page_days)
+    progress_by_day = _light_page_progress_rows(conn, page_days, snapshots_by_day)
+    timings["snapshots_progress_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+    t0 = time.perf_counter()
     memory_specs = parse_memory_threshold_specs_from_text(memory_thresholds_text) or parse_memory_threshold_specs_from_text(FALLBACK_MEMORY_THRESHOLDS)
-    page_memory_stats = _light_page_memory_stats(conn, page_days, memory_specs)
+    page_memory_stats = _light_page_memory_stats(conn, page_days, memory_specs, rows=page_record_rows)
     timings["memory_stats_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
     build_start = time.perf_counter()
     for index, day in enumerate(page_days, start=1):
         day_start = time.perf_counter()
 
-        snap = latest_snapshot_time_for_day(conn, day)
-        records = _light_overview_records_for_day(conn, day) if snap else []
-        progress_row = _light_latest_progress_row_for_day(conn, day, snap)
+        snap = snapshots_by_day.get(day)
+        records = records_by_day.get(day) or []
+        progress_row = progress_by_day.get(day)
         memory_stats = page_memory_stats.get(day)
 
         summary = _light_summary_from_records_and_progress(

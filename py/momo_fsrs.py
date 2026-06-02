@@ -215,33 +215,117 @@ def _build_word_histories(conn: sqlite3.Connection, max_words: int) -> tuple[dic
 
 
 
+def _review_history_event_from_row(row: sqlite3.Row) -> tuple[str, datetime, int, dict[str, Any]] | None:
+    key = str(row["word_key"] or "").strip()
+    if not key:
+        return None
+
+    response = str(row["last_response"] or row["last_response_cn"] or "").strip()
+    if not response or response in {"STUDY_RESPONSE_UNSPECIFIED", "未作答"}:
+        return None
+
+    review_dt = _to_utc_datetime(str(row["review_day_key"] or ""), fallback_date=str(row["source_day_key"] or ""))
+    if not review_dt:
+        return None
+
+    try:
+        study_count = int(row["study_count"] or 0)
+    except Exception:
+        study_count = 0
+
+    voc_id = str(row["voc_id"] or "").strip()
+    return (
+        key,
+        review_dt,
+        study_count,
+        {
+            "wordKey": key,
+            "vocId": voc_id,
+            "word": str(row["spelling"] or key),
+            "studyCount": study_count,
+            "lastStudyDateRaw": row["review_day_key"] or "",
+            "nextStudyDateRaw": row["next_study_day_key"] or "",
+            "lastStudyDate": _date_only(row["review_day_key"]),
+            "nextStudyDate": _date_only(row["next_study_day_key"]),
+            "memoryDurabilityDays": row["review_span_days"],
+            "reviewSpanDays": row["review_span_days"],
+            "response": _canonical_response(response),
+            "reviewDate": review_dt.date().isoformat(),
+        },
+    )
+
+
+def _review_history_state_index_for_word_keys(
+    conn: sqlite3.Connection,
+    wanted: set[str],
+    max_words: int,
+) -> dict[str, list[dict[str, Any]]]:
+    values = sorted(wanted)
+    rows: list[sqlite3.Row] = []
+    for start in range(0, len(values), 800):
+        chunk = values[start:start + 800]
+        placeholders = ",".join("?" for _ in chunk)
+        rows.extend(conn.execute(
+            f"""
+            SELECT
+              word_key, voc_id, spelling, study_count, last_response, last_response_cn,
+              review_day_key, source_day_key, next_study_day_key, review_span_days, review_index
+            FROM reviews
+            WHERE word_key IN ({placeholders})
+            ORDER BY word_key, review_index
+            """,
+            chunk,
+        ).fetchall())
+
+    accepted_word_keys: set[str] = set()
+    grouped: dict[str, list[tuple[datetime, int, dict[str, Any]]]] = {}
+    for row in rows:
+        event = _review_history_event_from_row(row)
+        if event is None:
+            continue
+        key, review_dt, study_count, payload = event
+        if key not in wanted:
+            continue
+        if key not in accepted_word_keys:
+            if len(accepted_word_keys) >= max_words:
+                continue
+            accepted_word_keys.add(key)
+        grouped.setdefault(key, []).append((review_dt, study_count, payload))
+
+    out: dict[str, list[dict[str, Any]]] = {}
+    for key, events in grouped.items():
+        events.sort(key=lambda item: (item[0], item[1]))
+        out[key] = [item[2] for item in events]
+    return out
+
+
 def build_review_history_state_index(
     conn: sqlite3.Connection,
-    voc_ids: set[str] | None = None,
+    word_keys: set[str] | None = None,
     max_words: int = 100000,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Return FSRS input history states indexed by voc_id.
+    """Return FSRS input history states indexed by local word_key.
 
     This exposes the same historical input chain used by the FSRS prediction
     module. Each event is one deduplicated review state recovered from daily
     overview snaps. It is meant for consumers that need the previous
     review state for a current word, such as time-point comparison.
     """
+    wanted = {str(v).strip() for v in (word_keys or set()) if str(v).strip()}
+    if wanted:
+        return _review_history_state_index_for_word_keys(conn, wanted, max_words)
+
     histories, current_records, _latest_day = _build_word_histories(conn, max_words)
-    wanted = {str(v).strip() for v in (voc_ids or set()) if str(v).strip()}
     out: dict[str, list[dict[str, Any]]] = {}
 
     for key, events in histories.items():
         rec = current_records.get(key) or {}
         voc_id = str(rec.get("voc_id") or rec.get("vocId") or "").strip()
-        if not voc_id:
-            continue
-        if wanted and voc_id not in wanted:
-            continue
 
         rows: list[dict[str, Any]] = []
         for event in events:
             rows.append({
+                "wordKey": key,
                 "vocId": voc_id,
                 "word": event.word,
                 "studyCount": event.study_count,
@@ -254,7 +338,7 @@ def build_review_history_state_index(
                 "response": _canonical_response(event.response),
                 "reviewDate": event.review_datetime.date().isoformat(),
             })
-        out[voc_id] = rows
+        out[key] = rows
 
     return out
 

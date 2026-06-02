@@ -1236,7 +1236,7 @@ def main() -> int:
     service_log(f"项目目录: {root}")
     service_log(f"数据库: {db_path}")
     service_log(f"访问地址: http://{args.host}:{args.port}/")
-    service_log("提示: 查看完毕后，请在 Termux 中按 Ctrl + C 停止服务")
+    service_log("提示: 查看完毕后，请按 Ctrl + C 停止服务")
     service_log("------------------------------------------------")
 
     try:

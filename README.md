@@ -56,10 +56,10 @@ python start.py --no-install
 python start.py --no-open
 ```
 
-Android / Termux 下可使用：
+Windows 与 Android / Termux 使用相同命令：
 
 ```bash
-python start.py --tmux
+python start.py
 ```
 
 ## API Token
